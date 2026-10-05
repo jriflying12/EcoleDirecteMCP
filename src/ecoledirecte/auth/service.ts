@@ -201,7 +201,7 @@ export class AuthService {
         postUrl,
         payload as unknown as Record<string, unknown>,
         // The web client enables credentials on both bootstrap and login.
-        { includeCookies: true },
+        { includeCookies: true, formEncoding: "browser" },
       );
 
       this.http.captureAuthHeaders(res);
@@ -1395,7 +1395,7 @@ export class AuthService {
           string,
           unknown
         >,
-        { includeCookies: true },
+        { includeCookies: true, formEncoding: "browser" },
       );
 
     this.http.captureAuthHeaders(res);

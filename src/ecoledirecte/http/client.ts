@@ -290,6 +290,8 @@ export class EdHttpClient {
       includeToken?: boolean;
       includeTwoFaToken?: boolean;
       includeCookies?: boolean;
+      /** Match the observed EcoleDirecte web serializer for login requests. */
+      formEncoding?: "standard" | "browser";
     } = {},
   ): Promise<Response> {
     if (new URL(url).pathname.endsWith("/login.awp")) {
@@ -300,10 +302,15 @@ export class EdHttpClient {
         challengePresent: typeof data.cn === "string" && typeof data.cv === "string",
       });
     }
-    const body =
-      `data=${encodeURIComponent(
-        JSON.stringify(data)
-      )}`;
+    // The web client's E7/v7 serializer escapes only form separators inside
+    // string values, then sends pretty-printed JSON directly after `data=`.
+    // Retain standard encoding for callers that do not request browser parity.
+    const body = opts.formEncoding === "browser"
+      ? `data=${JSON.stringify(data, (_key, value) =>
+          typeof value === "string"
+            ? value.replaceAll("%", "%25").replaceAll("&", "%26").replaceAll("+", "%2B")
+            : value, 4)}`
+      : `data=${encodeURIComponent(JSON.stringify(data))}`;
 
     return this.request(url, {
       method: "POST",

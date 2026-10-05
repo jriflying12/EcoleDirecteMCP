@@ -410,3 +410,35 @@ describe("safe authentication diagnostics", () => {
     }
   });
 });
+
+describe("browser form serialization", () => {
+  it("matches the observed login body while preserving special characters", async () => {
+    const originalFetch = globalThis.fetch;
+    let capturedBody = "";
+    globalThis.fetch = (async (_input, init) => {
+      capturedBody = String(init?.body);
+      return new Response("{}");
+    }) as typeof fetch;
+    try {
+      const client = new EdHttpClient();
+      const payload = { motdepasse: " synthetic +&%=é ", fa: [{ cv: "synthetic+/=", uniq: false }] };
+      await client.postForm("https://example.test", payload, { formEncoding: "browser" });
+      expect(capturedBody).toBe([
+        'data={',
+        '    "motdepasse": " synthetic %2B%26%25=é ",',
+        '    "fa": [',
+        '        {',
+        '            "cv": "synthetic%2B/=",',
+        '            "uniq": false',
+        '        }',
+        '    ]',
+        '}',
+      ].join("\n"));
+      expect(JSON.parse(new URLSearchParams(capturedBody).get("data")!)).toEqual(payload);
+      await client.postForm("https://example.test", payload);
+      expect(capturedBody).toBe(`data=${encodeURIComponent(JSON.stringify(payload))}`);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});

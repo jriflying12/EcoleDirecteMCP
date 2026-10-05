@@ -391,7 +391,7 @@ describe("AuthService", () => {
         expect.objectContaining({
           fa: [{ cv: "123456", cn: "" }],
         }),
-        { includeCookies: true },
+        { includeCookies: true, formEncoding: "browser" },
       );
       expect(store.saveCredentials).toHaveBeenCalledWith({ identifiant: "user", motdepasse: "pass" }, undefined);
     });
@@ -484,7 +484,7 @@ describe("AuthService", () => {
           uuid: "",
           fa: doubleAuthReplayFa(),
         },
-        { includeCookies: true },
+        { includeCookies: true, formEncoding: "browser" },
       );
       expect(http.postForm).toHaveBeenNthCalledWith(
         3,
@@ -840,13 +840,13 @@ describe("AuthService", () => {
         1,
         expect.stringContaining("/v3/login.awp?v=4.96.3"),
         expect.objectContaining({ fa: staleFa }),
-        { includeCookies: true },
+        { includeCookies: true, formEncoding: "browser" },
       );
       expect(http.postForm).toHaveBeenNthCalledWith(
         2,
         expect.stringContaining("/v3/login.awp?v=4.96.3"),
         expect.objectContaining({ fa: [] }),
-        { includeCookies: true },
+        { includeCookies: true, formEncoding: "browser" },
       );
       expect(store.saveCredentials).toHaveBeenCalledWith({ identifiant: "user", motdepasse: "pass" }, undefined);
     });
@@ -1508,6 +1508,10 @@ describe("browser login wire protocol", () => {
           expect(request.headers.get("X-GTK")).toBe(`synthetic+gtk/${index + 1}=`);
           expect(request.headers.get("Content-Type")).toBe("application/x-www-form-urlencoded");
           expect(request.init.redirect).toBe("manual");
+          // All login branches must use the actual web serializer, not merely
+          // a different wire body that a standard form parser treats equally.
+          expect(String(request.init.body).startsWith('data={\n    "identifiant":')).toBe(true);
+          expect(String(request.init.body)).toContain('"motdepasse": " synthetic %2B%26%25=é "');
           const form = new URLSearchParams(String(request.init.body));
           expect([...form.keys()]).toEqual(["data"]);
           const payload = JSON.parse(form.get("data")!);
