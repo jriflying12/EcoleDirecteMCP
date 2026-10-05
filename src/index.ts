@@ -40,13 +40,53 @@ async function main(): Promise<void> {
     authDir ? { dir: authDir } : undefined
   );
 
+  // ---------------------------------------------------------------------------
+  // Bootstrap EcoleDirecte credentials from Railway secrets
+  // ---------------------------------------------------------------------------
+
+  const existingCredentials =
+    await store.loadCredentials();
+
+  if (!existingCredentials) {
+    const identifiant =
+      process.env.ECOLEDIRECTE_USERNAME;
+
+    const motdepasse =
+      process.env.ECOLEDIRECTE_PASSWORD;
+
+    if (identifiant && motdepasse) {
+      await store.saveCredentials({
+        identifiant,
+        motdepasse,
+      });
+
+      log(
+        "info",
+        "EcoleDirecte credentials initialized from environment"
+      );
+    } else {
+      log(
+        "warn",
+        "No stored EcoleDirecte credentials and environment credentials are missing"
+      );
+    }
+  } else {
+    log(
+      "info",
+      "Stored EcoleDirecte credentials found"
+    );
+  }
+
   const auth = new AuthService(http, store);
   const data = new EdDataService(http, auth);
 
   try {
     const restored = await auth.restore();
 
-    log("info", `Auth restore result: ${restored.status}`);
+    log(
+      "info",
+      `Auth restore result: ${restored.status}`
+    );
 
     if (restored.status === "error") {
       log(
@@ -73,7 +113,6 @@ async function main(): Promise<void> {
 
   app.use(express.json());
 
-  // Railway health check
   app.get("/", (_req, res) => {
     res.status(200).json({
       status: "ok",
@@ -87,13 +126,6 @@ async function main(): Promise<void> {
 
   registerOAuthRoutes(app);
 
-  /*
-   * Protect the MCP resource with OAuth.
-   *
-   * When Claude accesses /mcp without a valid access token,
-   * advertise the Protected Resource Metadata endpoint so that
-   * Claude can discover the OAuth authorization server.
-   */
   app.use("/mcp", (req, res, next) => {
     if (!isValidOAuthToken(req)) {
       const baseUrl = (
@@ -132,12 +164,10 @@ async function main(): Promise<void> {
     return server;
   }
 
-  /*
-   * Streamable HTTP is sessionful here.
-   *
-   * Each initialized MCP session keeps its transport so subsequent
-   * POST / GET / DELETE requests can use the same session.
-   */
+  // ---------------------------------------------------------------------------
+  // MCP sessions
+  // ---------------------------------------------------------------------------
+
   const transports = new Map<
     string,
     StreamableHTTPServerTransport
@@ -154,7 +184,6 @@ async function main(): Promise<void> {
           | string
           | undefined;
 
-      // Existing MCP session
       if (sessionId) {
         const transport =
           transports.get(sessionId);
@@ -181,7 +210,6 @@ async function main(): Promise<void> {
         return;
       }
 
-      // A request without a session must be an initialize request.
       if (!isInitializeRequest(req.body)) {
         res.status(400).json({
           jsonrpc: "2.0",
@@ -376,7 +404,7 @@ async function main(): Promise<void> {
   });
 
   // ---------------------------------------------------------------------------
-  // Start server
+  // Start
   // ---------------------------------------------------------------------------
 
   const port = Number(
