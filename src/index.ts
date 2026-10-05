@@ -41,44 +41,38 @@ async function main(): Promise<void> {
   );
 
   // ---------------------------------------------------------------------------
-  // Bootstrap EcoleDirecte credentials from Railway secrets
+  // Synchronize EcoleDirecte credentials from Railway secrets
   // ---------------------------------------------------------------------------
 
-  const existingCredentials =
-    await store.loadCredentials();
+  const identifiant =
+    process.env.ECOLEDIRECTE_USERNAME;
 
-  if (!existingCredentials) {
-    const identifiant =
-      process.env.ECOLEDIRECTE_USERNAME;
+  const motdepasse =
+    process.env.ECOLEDIRECTE_PASSWORD;
 
-    const motdepasse =
-      process.env.ECOLEDIRECTE_PASSWORD;
+  if (identifiant && motdepasse) {
+    await store.saveCredentials({
+      identifiant: identifiant.trim(),
+      motdepasse,
+    });
 
-    if (identifiant && motdepasse) {
-      await store.saveCredentials({
-        identifiant,
-        motdepasse,
-      });
-
-      log(
-        "info",
-        "EcoleDirecte credentials initialized from environment"
-      );
-    } else {
-      log(
-        "warn",
-        "No stored EcoleDirecte credentials and environment credentials are missing"
-      );
-    }
-  } else {
     log(
       "info",
-      "Stored EcoleDirecte credentials found"
+      "EcoleDirecte credentials synchronized from environment"
+    );
+  } else {
+    log(
+      "warn",
+      "EcoleDirecte environment credentials are missing"
     );
   }
 
   const auth = new AuthService(http, store);
   const data = new EdDataService(http, auth);
+
+  // ---------------------------------------------------------------------------
+  // Restore EcoleDirecte session or login from stored credentials
+  // ---------------------------------------------------------------------------
 
   try {
     const restored = await auth.restore();
@@ -113,6 +107,7 @@ async function main(): Promise<void> {
 
   app.use(express.json());
 
+  // Railway health check
   app.get("/", (_req, res) => {
     res.status(200).json({
       status: "ok",
@@ -126,6 +121,12 @@ async function main(): Promise<void> {
 
   registerOAuthRoutes(app);
 
+  /*
+   * Protect the MCP endpoint with OAuth.
+   *
+   * If Claude calls /mcp without a valid token,
+   * advertise the Protected Resource Metadata endpoint.
+   */
   app.use("/mcp", (req, res, next) => {
     if (!isValidOAuthToken(req)) {
       const baseUrl = (
@@ -184,6 +185,7 @@ async function main(): Promise<void> {
           | string
           | undefined;
 
+      // Existing MCP session
       if (sessionId) {
         const transport =
           transports.get(sessionId);
@@ -210,6 +212,7 @@ async function main(): Promise<void> {
         return;
       }
 
+      // A request without a session must be an initialize request
       if (!isInitializeRequest(req.body)) {
         res.status(400).json({
           jsonrpc: "2.0",
@@ -404,7 +407,7 @@ async function main(): Promise<void> {
   });
 
   // ---------------------------------------------------------------------------
-  // Start
+  // Start server
   // ---------------------------------------------------------------------------
 
   const port = Number(
