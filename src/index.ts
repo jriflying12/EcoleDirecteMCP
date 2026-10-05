@@ -21,11 +21,13 @@ async function main(): Promise<void> {
 
   const http = new EdHttpClient();
 
-  const credentialsFile =
-    process.env.ECOLEDIRECTE_CREDENTIALS_FILE || undefined;
+  // Store EcoleDirecte credentials/session on the persistent Railway volume.
+  // On Railway, ECOLEDIRECTE_AUTH_DIR should be set to /data.
+  const authDir =
+    process.env.ECOLEDIRECTE_AUTH_DIR || undefined;
 
   const store = new FileAuthStore(
-    credentialsFile ? { credentialsFile } : undefined
+    authDir ? { dir: authDir } : undefined
   );
 
   const auth = new AuthService(http, store);
@@ -60,28 +62,29 @@ async function main(): Promise<void> {
     });
   });
 
+  // Protect the MCP endpoint with a Bearer API key.
   function isAuthorized(req: express.Request): boolean {
-  const apiKey = process.env.MCP_API_KEY;
+    const apiKey = process.env.MCP_API_KEY;
 
-  if (!apiKey) {
-    return false;
+    if (!apiKey) {
+      return false;
+    }
+
+    const authorization = req.headers.authorization;
+
+    return authorization === `Bearer ${apiKey}`;
   }
 
-  const authorization = req.headers.authorization;
+  app.use("/mcp", (req, res, next) => {
+    if (!isAuthorized(req)) {
+      res.status(401).json({
+        error: "Unauthorized",
+      });
+      return;
+    }
 
-  return authorization === `Bearer ${apiKey}`;
-}
-
-app.use("/mcp", (req, res, next) => {
-  if (!isAuthorized(req)) {
-    res.status(401).json({
-      error: "Unauthorized",
-    });
-    return;
-  }
-
-  next();
-});
+    next();
+  });
 
   app.post("/mcp", async (req, res) => {
     const server = new McpServer({
