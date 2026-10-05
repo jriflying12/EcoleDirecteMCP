@@ -60,6 +60,29 @@ async function main(): Promise<void> {
     });
   });
 
+  function isAuthorized(req: express.Request): boolean {
+  const apiKey = process.env.MCP_API_KEY;
+
+  if (!apiKey) {
+    return false;
+  }
+
+  const authorization = req.headers.authorization;
+
+  return authorization === `Bearer ${apiKey}`;
+}
+
+app.use("/mcp", (req, res, next) => {
+  if (!isAuthorized(req)) {
+    res.status(401).json({
+      error: "Unauthorized",
+    });
+    return;
+  }
+
+  next();
+});
+
   app.post("/mcp", async (req, res) => {
     const server = new McpServer({
       name: "ecoledirecte-mcp",
