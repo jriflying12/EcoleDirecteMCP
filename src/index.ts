@@ -50,11 +50,47 @@ async function main(): Promise<void> {
   const motdepasse =
     process.env.ECOLEDIRECTE_PASSWORD;
 
+  const faCn =
+    process.env.ECOLEDIRECTE_FA_CN;
+
+  const faCv =
+    process.env.ECOLEDIRECTE_FA_CV;
+
   if (identifiant && motdepasse) {
-    await store.saveCredentials({
+    const credentials: {
+      identifiant: string;
+      motdepasse: string;
+      fa?: Array<{
+        cn: string;
+        cv: string;
+        uniq: boolean;
+      }>;
+    } = {
       identifiant: identifiant.trim(),
       motdepasse,
-    });
+    };
+
+    if (faCn && faCv) {
+      credentials.fa = [
+        {
+          cn: faCn.trim(),
+          cv: faCv.trim(),
+          uniq: false,
+        },
+      ];
+
+      log(
+        "info",
+        "EcoleDirecte remembered authentication factor loaded from environment"
+      );
+    } else {
+      log(
+        "warn",
+        "EcoleDirecte remembered authentication factor is missing from environment"
+      );
+    }
+
+    await store.saveCredentials(credentials);
 
     log(
       "info",
