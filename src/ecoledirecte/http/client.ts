@@ -125,6 +125,7 @@ export class EdHttpClient {
       includeGtk?: boolean;
       includeToken?: boolean;
       includeTwoFaToken?: boolean;
+      includeCookies?: boolean;
     } = {},
   ): Record<string, string> {
     const includeGtk =
@@ -136,17 +137,17 @@ export class EdHttpClient {
     const includeTwoFaToken =
       opts.includeTwoFaToken ?? true;
 
+    const includeCookies = opts.includeCookies ?? true;
+
     const h: Record<string, string> = {
       "User-Agent": DEFAULT_USER_AGENT,
       Accept: "application/json, text/plain, */*",
       Referer: ECOLEDIRECTE_REFERER,
     };
 
-    const cookieStr =
-      this.buildCookieHeader();
-
-    if (cookieStr) {
-      h["Cookie"] = cookieStr;
+    if (includeCookies) {
+      const cookieStr = this.buildCookieHeader();
+      if (cookieStr) h["Cookie"] = cookieStr;
     }
 
     if (includeGtk) {
@@ -246,6 +247,7 @@ export class EdHttpClient {
       includeGtk?: boolean;
       includeToken?: boolean;
       includeTwoFaToken?: boolean;
+      includeCookies?: boolean;
     } = {},
   ): Promise<Response> {
     const body =
