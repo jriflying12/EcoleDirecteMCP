@@ -76,8 +76,9 @@ Supply `ECOLEDIRECTE_USERNAME` and `ECOLEDIRECTE_PASSWORD` securely; optional
 synchronizes them to the auth store without trimming the password, then restores
 or validates a stored session, falling back to login when needed.
 
-Login POSTs retain X-GTK but omit cookies, matching the supplied successful browser
-trace. Cookies remain available for other API requests. A 505 with remembered
+Login POSTs retain cookies, matching the browser auth service's explicit
+`withCredentials: true` setting. X-GTK is URL-decoded from the GTK cookie,
+matching Angular's XSRF extractor; the cookie jar keeps the original value. A 505 with remembered
 factors triggers one existing fallback without them; a single startup can thus
 send two login POSTs. Avoid repeated restarts or login calls after a rejection.
 Local protocol tests use synthetic data and do not establish successful live

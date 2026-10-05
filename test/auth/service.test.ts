@@ -391,7 +391,7 @@ describe("AuthService", () => {
         expect.objectContaining({
           fa: [{ cv: "123456", cn: "" }],
         }),
-        { includeCookies: false },
+        { includeCookies: true },
       );
       expect(store.saveCredentials).toHaveBeenCalledWith({ identifiant: "user", motdepasse: "pass" }, undefined);
     });
@@ -484,7 +484,7 @@ describe("AuthService", () => {
           uuid: "",
           fa: doubleAuthReplayFa(),
         },
-        { includeCookies: false },
+        { includeCookies: true },
       );
       expect(http.postForm).toHaveBeenNthCalledWith(
         3,
@@ -840,13 +840,13 @@ describe("AuthService", () => {
         1,
         expect.stringContaining("/v3/login.awp?v=4.96.3"),
         expect.objectContaining({ fa: staleFa }),
-        { includeCookies: false },
+        { includeCookies: true },
       );
       expect(http.postForm).toHaveBeenNthCalledWith(
         2,
         expect.stringContaining("/v3/login.awp?v=4.96.3"),
         expect.objectContaining({ fa: [] }),
-        { includeCookies: false },
+        { includeCookies: true },
       );
       expect(store.saveCredentials).toHaveBeenCalledWith({ identifiant: "user", motdepasse: "pass" }, undefined);
     });
@@ -1450,7 +1450,7 @@ describe("AuthService", () => {
 // Exercise AuthService through the real HTTP serializer, without network access.
 describe("browser login wire protocol", () => {
   it.each(["direct", "stale-factor", "totp", "doubleauth"] as const)(
-    "%s login retains GTK but omits cookies, then restores cookie use for data requests",
+    "%s login decodes GTK and retains cookies for login and data requests",
     async (flow) => {
       const originalFetch = globalThis.fetch;
       const http = new EdHttpClient();
@@ -1467,7 +1467,7 @@ describe("browser login wire protocol", () => {
         if (url.searchParams.get("gtk") === "1") {
           bootstraps++;
           const headers = new Headers();
-          headers.append("Set-Cookie", `GTK=synthetic-gtk-${bootstraps}; Path=/`);
+          headers.append("Set-Cookie", `GTK=synthetic%2Bgtk%2F${bootstraps}%3D; Path=/`);
           headers.append("Set-Cookie", "SESSION=synthetic-session; Path=/");
           return response({ code: 200, token: "", message: "" }, headers);
         }
@@ -1504,8 +1504,8 @@ describe("browser login wire protocol", () => {
           r.url.pathname.endsWith("/login.awp") && r.init.method === "POST");
         for (const [index, request] of loginRequests.entries()) {
           expect(request.url.searchParams.get("v")).toBe("4.103.0");
-          expect(request.headers.has("Cookie")).toBe(false);
-          expect(request.headers.get("X-GTK")).toBe(`synthetic-gtk-${index + 1}`);
+          expect(request.headers.get("Cookie")).toContain(`GTK=synthetic%2Bgtk%2F${index + 1}%3D`);
+          expect(request.headers.get("X-GTK")).toBe(`synthetic+gtk/${index + 1}=`);
           expect(request.headers.get("Content-Type")).toBe("application/x-www-form-urlencoded");
           expect(request.init.redirect).toBe("manual");
           const form = new URLSearchParams(String(request.init.body));
@@ -1524,12 +1524,12 @@ describe("browser login wire protocol", () => {
         }
         expect((await svc.validateSession()).status).toBe("authenticated");
         const dataRequest = requests.at(-1)!;
-        expect(dataRequest.headers.get("Cookie")).toContain(`GTK=synthetic-gtk-${bootstraps}`);
+        expect(dataRequest.headers.get("Cookie")).toContain(`GTK=synthetic%2Bgtk%2F${bootstraps}%3D`);
         expect(dataRequest.headers.get("Cookie")).toContain("SESSION=synthetic-session");
         expect(dataRequest.headers.get("X-Token")).toBe("synthetic-final");
         expect(dataRequest.headers.get("2FA-Token")).toBe("synthetic-final-2fa");
         expect(store.saveSession).toHaveBeenCalledWith(expect.objectContaining({
-          cookies: { GTK: `synthetic-gtk-${bootstraps}`, SESSION: "synthetic-session" },
+          cookies: { GTK: `synthetic%2Bgtk%2F${bootstraps}%3D`, SESSION: "synthetic-session" },
         }), undefined);
       } finally {
         globalThis.fetch = originalFetch;

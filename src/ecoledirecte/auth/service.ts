@@ -199,8 +199,8 @@ export class AuthService {
       const res = await this.http.postForm(
         postUrl,
         payload as unknown as Record<string, unknown>,
-        // Match the browser login: X-GTK is sent without bootstrap cookies.
-        { includeCookies: false },
+        // The web client enables credentials on both bootstrap and login.
+        { includeCookies: true },
       );
 
       this.http.captureAuthHeaders(res);
@@ -1383,7 +1383,7 @@ export class AuthService {
           string,
           unknown
         >,
-        { includeCookies: false },
+        { includeCookies: true },
       );
 
     this.http.captureAuthHeaders(res);

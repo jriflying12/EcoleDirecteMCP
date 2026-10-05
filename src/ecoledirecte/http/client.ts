@@ -153,7 +153,7 @@ export class EdHttpClient {
     if (includeGtk) {
       const gtkValue =
         this.xGtk ??
-        this.cookies.get("GTK");
+        this.getGtkFromCookie();
 
       if (gtkValue) {
         h["X-GTK"] = gtkValue;
@@ -176,6 +176,18 @@ export class EdHttpClient {
     }
 
     return h;
+  }
+
+  /** Angular's XSRF extractor URL-decodes GTK; the Cookie header stays raw. */
+  private getGtkFromCookie(): string | undefined {
+    const raw = this.cookies.get("GTK");
+    if (raw === undefined) return undefined;
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      // Preserve non-encoded cookies containing a literal percent sign.
+      return raw;
+    }
   }
 
   private buildCookieHeader(): string {
