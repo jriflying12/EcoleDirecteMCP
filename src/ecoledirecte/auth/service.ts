@@ -1,3 +1,2317 @@
+/**
+ * Auth orchestration service for EcoleDirecte.
+ *
+ * Manages the login state machine:
+ *   logged-out → (bootstrap + login POST) → authenticated | totp-required | doubleauth-required | error
+ *   totp-required → (submit TOTP) → authenticated | error
+ *   doubleauth-required → (submit challenge answer + final login POST) → authenticated | error
+ *   session-imported → (validate) → authenticated | error
+ *
+ * Also handles credential persistence, session save/restore, and logout.
+ */
+
+import { EdHttpClient } from "../http/client.js";
+import { doubleAuthUrl, loginUrl, probeUrl, renewTokenUrl, switchRoleUrl } from "../api/constants.js";
+import { ApiCode, normalizeLoginResponse, normalizeProbeResponse, type RawApiResponse } from "../api/normalize.js";
+import { log } from "../logging.js";
+import type { AuthStore } from "./store.js";
+import type {
+  AuthState,
+  LoginFactor,
+  LoginPayload,
+  ProfileName,
+  StoredCredentials,
+  StoredSession,
+  AccountInfo,
+} from "./types.js";
+
+/** Verification questions answered in one login before we stop rather than retry. */
+const MAX_CHAINED_CHALLENGES = 3;
+
+export class AuthService {
+  private state: AuthState = { status: "logged-out" };
+  private pendingPayload: LoginPayload | undefined;
+
+  /**
+   * Second factors answered so far, mirroring the `fa` list the web app keeps in
+   * localStorage. EcoleDirecte can chain several questions in one login, and each
+   * POST carries every factor answered up to that point.
+   */
+  private answeredFactors: LoginFactor[] = [];
+
+  /** Questions answered in the current login, to bound a server that keeps asking. */
+  private chainedChallenges = 0;
+
+  /** In-flight login promise — prevents concurrent logins from corrupting state. */
+  private loginInFlight: Promise<AuthState> | undefined;
+
+  /** Per-account token cache — avoids redundant renewToken API calls. */
+  private accountTokens = new Map<number, string>();
+
+  /** Active named auth profile (undefined = legacy single-profile mode). */
+  private activeProfile: ProfileName | undefined;
+
+  constructor(
+    private readonly http: EdHttpClient,
+    private readonly store: AuthStore,
+  ) {}
+
+  getState(): AuthState {
+    return this.state;
+  }
+
+  getActiveProfile(): ProfileName | undefined {
+    return this.activeProfile;
+  }
+
+  async setActiveProfile(profile: ProfileName | undefined): Promise<void> {
+    if (profile === this.activeProfile) return;
+
+    // Clear current in-memory state when switching profiles
+    this.state = { status: "logged-out" };
+    this.pendingPayload = undefined;
+    this.answeredFactors = [];
+    this.clearAccountTokens();
+    this.http.clearAuth();
+
+    this.activeProfile = profile;
+
+    // Persist the active profile in the index
+    const index = await this.store.loadProfileIndex();
+    index.active = profile;
+
+    if (profile && !index.profiles.includes(profile)) {
+      index.profiles.push(profile);
+    }
+
+    await this.store.saveProfileIndex(index);
+  }
+
+  async listProfiles(): Promise<{
+    active?: ProfileName;
+    profiles: ProfileName[];
+  }> {
+    const index = await this.store.loadProfileIndex();
+
+    return {
+      active: this.activeProfile ?? index.active,
+      profiles: index.profiles,
+    };
+  }
+
+  // ── Direct login ─────────────────────────────────────────────
+
+  async loginFromStore(): Promise<AuthState> {
+    try {
+      const creds = await this.store.loadCredentials(this.activeProfile);
+
+      if (!creds) {
+        this.state = {
+          status: "error",
+          message:
+            "No credentials file found. Create a JSON file with {\"identifiant\": \"…\", \"motdepasse\": \"…\"} " +
+            "at the path given by ECOLEDIRECTE_CREDENTIALS_FILE, or at ~/.ecoledirecte/credentials.json.",
+          recoverable: true,
+        };
+
+        return this.state;
+      }
+
+      return this.login(
+        creds.identifiant,
+        creds.motdepasse,
+        creds.fa,
+      );
+    } catch (error) {
+      this.state = {
+        status: "error",
+        message: `Login failed: ${formatError(error)}`,
+        recoverable: true,
+      };
+
+      return this.state;
+    }
+  }
+
+  async login(
+    identifiant: string,
+    motdepasse: string,
+    persistedFa?: LoginFactor[],
+  ): Promise<AuthState> {
+    if (
+      this.state.status === "doubleauth-required" ||
+      this.state.status === "totp-required"
+    ) {
+      return this.state;
+    }
+
+    if (this.loginInFlight) {
+      return this.loginInFlight;
+    }
+
+    const task = this.performLogin(
+      identifiant,
+      motdepasse,
+      persistedFa,
+    );
+
+    this.loginInFlight = task;
+
+    try {
+      return await task;
+    } finally {
+      this.loginInFlight = undefined;
+    }
+  }
+
+  private async performLogin(
+    identifiant: string,
+    motdepasse: string,
+    persistedFa?: LoginFactor[],
+  ): Promise<AuthState> {
+    this.http.clearAuth();
+    this.state = { status: "login-pending" };
+
+    try {
+      // 1. Bootstrap — obtain GTK cookie + header value
+      await this.bootstrapGtk();
+
+      // 2. Login POST
+      const reusableFa =
+        normalizeLoginFactors(persistedFa);
+
+      this.answeredFactors = [...reusableFa];
+      this.chainedChallenges = 0;
+
+      const payload: LoginPayload = {
+        identifiant,
+        motdepasse,
+        isReLogin: false,
+        uuid: "",
+        fa: reusableFa,
+      };
+
+      this.pendingPayload = payload;
+
+      const postUrl = loginUrl({
+        version: this.http.version,
+      });
+
+      const res = await this.http.postForm(
+        postUrl,
+        payload as unknown as Record<string, unknown>,
+      );
+
+      this.http.captureAuthHeaders(res);
+
+      const body =
+        (await res.json()) as RawApiResponse;
+
+      const result =
+        normalizeLoginResponse(body);
+
+      switch (result.nextState) {
+        case "authenticated": {
+          return this.completeAuthentication(
+            body,
+            buildStoredCredentials(
+              identifiant,
+              motdepasse,
+              reusableFa,
+            ),
+          );
+        }
+
+        case "totp-required": {
+          const totp =
+            !!(result.challenge?.totp ?? true);
+
+          this.state = {
+            status: "totp-required",
+            challenge: result.challenge ?? {},
+            totp,
+          };
+
+          break;
+        }
+
+        case "doubleauth-required":
+          return this.fetchDoubleAuthChallenge();
+
+        default:
+          if (
+            reusableFa.length > 0 &&
+            body.code === ApiCode.INVALID_CREDENTIALS
+          ) {
+            return this.performLogin(
+              identifiant,
+              motdepasse,
+            );
+          }
+
+          this.state = {
+            status: "error",
+            message:
+              result.message ?? "Login failed",
+            recoverable:
+              result.nextState === "error",
+          };
+      }
+
+      return this.state;
+    } catch (error) {
+      this.state = {
+        status: "error",
+        message: `Login failed: ${formatError(error)}`,
+        recoverable: true,
+      };
+
+      return this.state;
+    }
+  }
+
+  // ── TOTP continuation ────────────────────────────────────────
+
+  async submitTotp(
+    code: string,
+  ): Promise<AuthState> {
+    if (
+      this.state.status !== "totp-required" ||
+      !this.pendingPayload
+    ) {
+      return {
+        status: "error",
+        message: "No pending TOTP challenge",
+        recoverable: false,
+      };
+    }
+
+    try {
+      const payload: LoginPayload = {
+        ...this.pendingPayload,
+        fa: [
+          {
+            cv: code,
+            cn: "",
+          },
+        ],
+      };
+
+      const body =
+        await this.replayLogin(payload);
+
+      const result =
+        normalizeLoginResponse(body);
+
+      if (
+        result.nextState === "authenticated"
+      ) {
+        return this.completeAuthentication(
+          body,
+          buildStoredCredentials(
+            this.pendingPayload.identifiant,
+            this.pendingPayload.motdepasse,
+            this.pendingPayload.fa,
+          ),
+        );
+      }
+
+      this.state = {
+        status: "error",
+        message:
+          result.message ??
+          "TOTP verification failed",
+        recoverable: true,
+      };
+
+      return this.state;
+    } catch (error) {
+      this.state = {
+        status: "error",
+        message:
+          `TOTP submission failed: ${formatError(error)}`,
+        recoverable: true,
+      };
+
+      return this.state;
+    }
+  }
+
+  // ── Secure question continuation ───────────────────────────
+
+  async submitDoubleAuthChoice(
+    choiceIndex: number,
+  ): Promise<AuthState> {
+    if (
+      this.state.status !==
+        "doubleauth-required" ||
+      !this.pendingPayload
+    ) {
+      return {
+        status: "error",
+        message:
+          "No pending identity verification challenge",
+        recoverable: false,
+      };
+    }
+
+    const choice =
+      this.state.choices[choiceIndex - 1];
+
+    if (!choice) {
+      return {
+        status: "error",
+        message:
+          `Invalid choice index ${choiceIndex}`,
+        recoverable: true,
+      };
+    }
+
+    try {
+      const challengeRes =
+        await this.http.postForm(
+          doubleAuthUrl({
+            verb: "post",
+            version: this.http.version,
+          }),
+          {
+            choix: choice.value,
+          },
+          {
+            includeGtk: false,
+          },
+        );
+
+      this.http.captureAuthHeaders(
+        challengeRes,
+      );
+
+      const challengeBody =
+        (await challengeRes.json()) as RawApiResponse;
+
+      const challengeData =
+        challengeBody.data as
+          | Record<string, unknown>
+          | undefined;
+
+      const cn =
+        typeof challengeData?.cn === "string"
+          ? challengeData.cn
+          : undefined;
+
+      const cv =
+        typeof challengeData?.cv === "string"
+          ? challengeData.cv
+          : undefined;
+
+      if (
+        challengeBody.code !== ApiCode.OK ||
+        !cn ||
+        !cv
+      ) {
+        this.state = {
+          status: "error",
+          message:
+            challengeBody.message ||
+            `Identity verification failed — the challenge answer was rejected (code ${challengeBody.code})`,
+          recoverable: true,
+        };
+
+        return this.state;
+      }
+
+      // The web app merges the answered challenge into the credentials object
+      // (`doLogin({...credentials, cn, cv})`) and its auth service then appends
+      // `uuid` plus the remembered-factor list, so both copies of cn/cv go out.
+      // We previously sent only the `fa` entry, and the API answered a correctly
+      // answered challenge with "Identifiant et/ou mot de passe invalide !".
+      const payload: LoginPayload = {
+        identifiant:
+          this.pendingPayload.identifiant,
+        motdepasse:
+          this.pendingPayload.motdepasse,
+        isReLogin:
+          this.pendingPayload.isReLogin,
+        cn,
+        cv,
+        uuid:
+          this.pendingPayload.uuid,
+        fa: this.recordAnsweredFactor({
+          cn,
+          cv,
+          uniq: false,
+        }),
+      };
+
+      const loginBody =
+        await this.replayLogin(payload);
+
+      const result =
+        normalizeLoginResponse(loginBody);
+
+      if (
+        result.nextState === "authenticated"
+      ) {
+        return this.completeAuthentication(
+          loginBody,
+          buildStoredCredentials(
+            this.pendingPayload.identifiant,
+            this.pendingPayload.motdepasse,
+            payload.fa,
+          ),
+        );
+      }
+
+      // EcoleDirecte can chain a second question.
+      if (
+        result.nextState ===
+        "doubleauth-required"
+      ) {
+        this.chainedChallenges += 1;
+
+        if (
+          this.chainedChallenges >
+          MAX_CHAINED_CHALLENGES
+        ) {
+          this.state = {
+            status: "error",
+            message:
+              `EcoleDirecte asked for another verification question after ${MAX_CHAINED_CHALLENGES} ` +
+              "accepted answers. Stopping rather than spending more login attempts — sign in on the " +
+              "website once to clear the challenge, then retry.",
+            recoverable: false,
+          };
+
+          return this.state;
+        }
+
+        return this.fetchDoubleAuthChallenge();
+      }
+
+      this.state = {
+        status: "error",
+        message:
+          result.message ??
+          `Identity verification failed — the final login returned code ${loginBody.code}`,
+        recoverable: true,
+      };
+
+      return this.state;
+    } catch (error) {
+      this.state = {
+        status: "error",
+        message:
+          `Identity verification failed: ${formatError(error)}`,
+        recoverable: true,
+      };
+
+      return this.state;
+    }
+  }
+
+  // ── Session import ───────────────────────────────────────────
+
+  async importSession(
+    session: StoredSession,
+  ): Promise<AuthState> {
+    this.http.loadCookies(session.cookies);
+
+    if (session.xGtk) {
+      this.http.setGtk(session.xGtk);
+    }
+
+    if (session.twoFaToken) {
+      this.http.setTwoFaToken(
+        session.twoFaToken,
+      );
+    }
+
+    this.http.setToken(session.token);
+
+    this.state = {
+      status: "session-imported",
+      token: session.token,
+      accounts: session.accounts,
+    };
+
+    await this.store.saveSession(
+      session,
+      this.activeProfile,
+    );
+
+    await this.ensureProfileIndexed();
+
+    return this.validateSession();
+  }
+
+  // ── Session validation (probe) ───────────────────────────────
+
+  async validateSession(): Promise<AuthState> {
+    const token = this.getActiveToken();
+
+    if (!token) {
+      this.state = {
+        status: "error",
+        message:
+          "No active session to validate",
+        recoverable: true,
+      };
+
+      return this.state;
+    }
+
+    try {
+      this.http.setToken(token);
+
+      const url = probeUrl({
+        version: this.http.version,
+      });
+
+      const res = await this.http.postForm(
+        url,
+        {},
+        {
+          includeGtk: false,
+        },
+      );
+
+      this.http.captureAuthHeaders(res);
+
+      const body =
+        (await res.json()) as RawApiResponse;
+
+      const probe =
+        normalizeProbeResponse(body);
+
+      if (probe.valid) {
+        const resolvedToken =
+          this.getResolvedToken(
+            probe.token ?? token,
+          );
+
+        if (
+          this.state.status ===
+          "authenticated"
+        ) {
+          const currentId =
+            this.state.accounts.find(
+              (a) => a.current === true,
+            )?.id;
+
+          if (currentId !== undefined) {
+            this.accountTokens.set(
+              currentId,
+              resolvedToken,
+            );
+          }
+
+          this.state = {
+            ...this.state,
+            token: resolvedToken,
+          };
+
+          await this.persistSession(
+            resolvedToken,
+            this.state.accounts,
+          );
+
+          return this.state;
+        }
+
+        const rawAccounts =
+          this.state.status ===
+          "session-imported"
+            ? this.state.accounts ?? []
+            : [];
+
+        const accounts =
+          ensureCurrentFlag(rawAccounts);
+
+        this.state = {
+          status: "authenticated",
+          token: resolvedToken,
+          accounts,
+        };
+
+        await this.persistSession(
+          resolvedToken,
+          accounts,
+        );
+
+        return this.state;
+      }
+
+      await this.store.clearSession(
+        this.activeProfile,
+      );
+
+      this.http.clearAuth();
+      this.clearAccountTokens();
+
+      const creds =
+        await this.store.loadCredentials(
+          this.activeProfile,
+        );
+
+      if (creds) {
+        return this.login(
+          creds.identifiant,
+          creds.motdepasse,
+          creds.fa,
+        );
+      }
+
+      this.state = {
+        status: "error",
+        message:
+          probe.reason ?? "Session invalid",
+        recoverable: true,
+      };
+
+      return this.state;
+    } catch (error) {
+      this.state = {
+        status: "error",
+        message:
+          `Session validation failed: ${formatError(error)}`,
+        recoverable: true,
+      };
+
+      return this.state;
+    }
+  }
+
+  // ── Account switching ────────────────────────────────────────
+
+  async switchAccount(
+    accountId: number,
+  ): Promise<AuthState> {
+    const current =
+      this.state.status ===
+      "session-imported"
+        ? await this.validateSession()
+        : this.state;
+
+    if (
+      current.status !== "authenticated"
+    ) {
+      return current;
+    }
+
+    const target =
+      current.accounts.find(
+        (account) =>
+          account.id === accountId,
+      );
+
+    if (!target) {
+      this.state = {
+        status: "error",
+        message:
+          `Unknown accountId ${accountId}.`,
+        recoverable: true,
+      };
+
+      return this.state;
+    }
+
+    if (
+      current.accounts.length === 1 ||
+      target.current === true
+    ) {
+      return current;
+    }
+
+    const cachedToken =
+      this.accountTokens.get(accountId);
+
+    if (cachedToken) {
+      this.http.setToken(cachedToken);
+
+      const accounts =
+        markCurrentAccount(
+          current.accounts,
+          accountId,
+        );
+
+      this.state = {
+        status: "authenticated",
+        token: cachedToken,
+        accounts,
+      };
+
+      await this.persistSession(
+        cachedToken,
+        accounts,
+      );
+
+      return this.state;
+    }
+
+    if (target.idLogin === undefined) {
+      this.state = {
+        status: "error",
+        message:
+          `Account switching requires idLogin metadata for accountId ${accountId}. Re-import a browser session that includes browser account metadata or authenticate again.`,
+        recoverable: true,
+      };
+
+      return this.state;
+    }
+
+    try {
+      const res =
+        await this.http.postForm(
+          renewTokenUrl({
+            version:
+              this.http.version,
+          }),
+          {
+            idUser: target.idLogin,
+            uuid: "",
+          },
+          {
+            includeGtk: false,
+          },
+        );
+
+      this.http.captureAuthHeaders(res);
+
+      const body =
+        (await res.json()) as RawApiResponse;
+
+      if (body.code !== ApiCode.OK) {
+        this.state = {
+          status: "error",
+          message:
+            body.message ||
+            `Unable to switch to accountId ${accountId}.`,
+          recoverable: true,
+        };
+
+        return this.state;
+      }
+
+      const resolvedAccountId =
+        extractCurrentAccountId(body) ??
+        accountId;
+
+      if (
+        resolvedAccountId !== accountId
+      ) {
+        this.state = {
+          status: "error",
+          message:
+            `Requested accountId ${accountId}, but EcoleDirecte returned accountId ${resolvedAccountId}.`,
+          recoverable: true,
+        };
+
+        return this.state;
+      }
+
+      const token =
+        this.getResolvedToken(body.token);
+
+      const accounts =
+        mergeAccountsAfterSwitch(
+          markCurrentAccount(
+            current.accounts,
+            resolvedAccountId,
+          ),
+          body,
+        );
+
+      this.accountTokens.set(
+        accountId,
+        token,
+      );
+
+      this.state = {
+        status: "authenticated",
+        token,
+        accounts,
+      };
+
+      await this.persistSession(
+        token,
+        accounts,
+      );
+
+      return this.state;
+    } catch (error) {
+      this.state = {
+        status: "error",
+        message:
+          `Account switch failed: ${formatError(error)}`,
+        recoverable: true,
+      };
+
+      return this.state;
+    }
+  }
+
+  /**
+   * Switch between teacher (P) and personnel (A) roles for dual-role accounts.
+   */
+  async switchRole(
+    role: "teacher" | "personnel",
+  ): Promise<AuthState> {
+    const current =
+      this.state.status ===
+      "session-imported"
+        ? await this.validateSession()
+        : this.state;
+
+    if (
+      current.status !== "authenticated"
+    ) {
+      return current;
+    }
+
+    const targetType =
+      role === "teacher" ? "P" : "A";
+
+    const account =
+      current.accounts.find(
+        (a) => a.current === true,
+      );
+
+    if (!account) {
+      this.state = {
+        status: "error",
+        message:
+          "No current account found. Authenticate first.",
+        recoverable: true,
+      };
+
+      return this.state;
+    }
+
+    if (!account.isProfEtPersonnel) {
+      this.state = {
+        status: "error",
+        message:
+          "This account does not support role switching. Only accounts with both teacher and personnel roles can switch.",
+        recoverable: true,
+      };
+
+      return this.state;
+    }
+
+    if (account.type === targetType) {
+      return current;
+    }
+
+    if (!account.uid) {
+      this.state = {
+        status: "error",
+        message:
+          "Role switching requires uid metadata. Re-import a browser session that includes uid or authenticate again.",
+        recoverable: true,
+      };
+
+      return this.state;
+    }
+
+    try {
+      const res =
+        await this.http.postForm(
+          switchRoleUrl({
+            version:
+              this.http.version,
+          }),
+          {
+            profil: targetType,
+            uid: account.uid,
+            uuid: "",
+          },
+          {
+            includeGtk: false,
+          },
+        );
+
+      this.http.captureAuthHeaders(res);
+
+      const body =
+        (await res.json()) as RawApiResponse;
+
+      if (body.code !== ApiCode.OK) {
+        this.state = {
+          status: "error",
+          message:
+            body.message ||
+            `Unable to switch to ${role} role.`,
+          recoverable: true,
+        };
+
+        return this.state;
+      }
+
+      const token =
+        this.getResolvedToken(body.token);
+
+      const freshAccounts =
+        extractAccounts(body);
+
+      const currentAccountId =
+        extractCurrentAccountId(body) ??
+        account.id;
+
+      const accounts =
+        applyCurrentAccount(
+          freshAccounts.length > 0
+            ? freshAccounts
+            : current.accounts,
+          currentAccountId,
+        );
+
+      this.accountTokens.set(
+        currentAccountId,
+        token,
+      );
+
+      this.state = {
+        status: "authenticated",
+        token,
+        accounts,
+      };
+
+      await this.persistSession(
+        token,
+        accounts,
+      );
+
+      return this.state;
+    } catch (error) {
+      this.state = {
+        status: "error",
+        message:
+          `Role switch failed: ${formatError(error)}`,
+        recoverable: true,
+      };
+
+      return this.state;
+    }
+  }
+
+  /** Invalidate per-account token cache. */
+  private clearAccountTokens(): void {
+    this.accountTokens.clear();
+  }
+
+  // ── Session restore on startup ───────────────────────────────
+
+  async restore(): Promise<AuthState> {
+    try {
+      const index =
+        await this.store.loadProfileIndex();
+
+      if (
+        index.active &&
+        !this.activeProfile
+      ) {
+        const legacyExists =
+          (await this.store.loadSession(
+            undefined,
+          )) !== undefined ||
+          (await this.store.loadCredentials(
+            undefined,
+          )) !== undefined;
+
+        if (!legacyExists) {
+          this.activeProfile =
+            index.active;
+        }
+      }
+
+      const session =
+        await this.store.loadSession(
+          this.activeProfile,
+        );
+
+      if (session) {
+        this.http.loadCookies(
+          session.cookies,
+        );
+
+        if (session.xGtk) {
+          this.http.setGtk(
+            session.xGtk,
+          );
+        }
+
+        if (session.twoFaToken) {
+          this.http.setTwoFaToken(
+            session.twoFaToken,
+          );
+        }
+
+        this.http.setToken(
+          session.token,
+        );
+
+        if (session.accountTokens) {
+          for (
+            const [id, token]
+            of Object.entries(
+              session.accountTokens,
+            )
+          ) {
+            this.accountTokens.set(
+              Number(id),
+              token,
+            );
+          }
+        }
+
+        const accounts =
+          ensureCurrentFlag(
+            session.accounts,
+          );
+
+        this.state = {
+          status: "session-imported",
+          token: session.token,
+          accounts,
+        };
+
+        return this.validateSession();
+      }
+
+      const creds =
+        await this.store.loadCredentials(
+          this.activeProfile,
+        );
+
+      if (creds) {
+        return this.login(
+          creds.identifiant,
+          creds.motdepasse,
+          creds.fa,
+        );
+      }
+
+      return this.state;
+    } catch (error) {
+      this.state = {
+        status: "error",
+        message:
+          `Session restore failed: ${formatError(error)}`,
+        recoverable: true,
+      };
+
+      return this.state;
+    }
+  }
+
+  // ── Logout ───────────────────────────────────────────────────
+
+  async logout(): Promise<AuthState> {
+    this.state = {
+      status: "logged-out",
+    };
+
+    this.pendingPayload = undefined;
+    this.answeredFactors = [];
+
+    this.clearAccountTokens();
+    this.http.clearAuth();
+
+    await this.store.clearSession(
+      this.activeProfile,
+    );
+
+    return this.state;
+  }
+
+  async logoutFull(): Promise<AuthState> {
+    this.state = {
+      status: "logged-out",
+    };
+
+    this.pendingPayload = undefined;
+    this.answeredFactors = [];
+
+    this.clearAccountTokens();
+    this.http.clearAuth();
+
+    await this.store.clearAll(
+      this.activeProfile,
+    );
+
+    return this.state;
+  }
+
+  // ── Internal helpers ─────────────────────────────────────────
+
+  private getActiveToken():
+    | string
+    | undefined {
+    if (
+      this.state.status ===
+      "authenticated"
+    ) {
+      return this.state.token;
+    }
+
+    if (
+      this.state.status ===
+      "session-imported"
+    ) {
+      return this.state.token;
+    }
+
+    return this.http.getToken();
+  }
+
+  private async fetchDoubleAuthChallenge():
+    Promise<AuthState> {
+    try {
+      const res =
+        await this.http.postForm(
+          doubleAuthUrl({
+            verb: "get",
+            version:
+              this.http.version,
+          }),
+          {},
+          {
+            includeGtk: false,
+          },
+        );
+
+      this.http.captureAuthHeaders(res);
+
+      const body =
+        (await res.json()) as RawApiResponse;
+
+      const data =
+        body.data as
+          | Record<string, unknown>
+          | undefined;
+
+      const question =
+        decodeBase64String(
+          data?.question,
+        );
+
+      const propositions =
+        Array.isArray(
+          data?.propositions,
+        )
+          ? data.propositions
+          : [];
+
+      const choices =
+        propositions.flatMap(
+          (value) => {
+            if (
+              typeof value !==
+              "string"
+            ) {
+              return [];
+            }
+
+            return [
+              {
+                label:
+                  decodeBase64String(
+                    value,
+                  ),
+                value,
+              },
+            ];
+          },
+        );
+
+      if (
+        body.code !== ApiCode.OK ||
+        !question ||
+        choices.length === 0
+      ) {
+        this.state = {
+          status: "error",
+          message:
+            body.message ||
+            "Unable to fetch identity verification challenge",
+          recoverable: true,
+        };
+
+        return this.state;
+      }
+
+      this.state = {
+        status:
+          "doubleauth-required",
+        question,
+        choices,
+      };
+
+      return this.state;
+    } catch (error) {
+      this.state = {
+        status: "error",
+        message:
+          `Identity verification challenge failed: ${formatError(error)}`,
+        recoverable: true,
+      };
+
+      return this.state;
+    }
+  }
+
+  private async completeAuthentication(
+    body: RawApiResponse,
+    creds: StoredCredentials,
+  ): Promise<AuthState> {
+    const token =
+      this.getResolvedToken(
+        body.token,
+      );
+
+    const accounts =
+      applyCurrentAccount(
+        extractAccounts(body),
+        extractCurrentAccountId(
+          body,
+        ),
+      );
+
+    this.clearAccountTokens();
+
+    const currentAccountId =
+      accounts.find(
+        (a) => a.current === true,
+      )?.id;
+
+    if (
+      currentAccountId !== undefined
+    ) {
+      this.accountTokens.set(
+        currentAccountId,
+        token,
+      );
+    }
+
+    this.state = {
+      status: "authenticated",
+      token,
+      accounts,
+    };
+
+    this.pendingPayload = undefined;
+
+    await this.persistSession(
+      token,
+      accounts,
+    );
+
+    await this.store.saveCredentials(
+      creds,
+      this.activeProfile,
+    );
+
+    await this.ensureProfileIndexed();
+
+    return this.state;
+  }
+
+  private recordAnsweredFactor(
+    factor: LoginFactor,
+  ): LoginFactor[] {
+    this.answeredFactors =
+      this.answeredFactors.filter(
+        (known) =>
+          known.cn !== factor.cn,
+      );
+
+    this.answeredFactors.push(
+      factor,
+    );
+
+    if (
+      this.answeredFactors.length >
+      10
+    ) {
+      this.answeredFactors.shift();
+    }
+
+    return [
+      ...this.answeredFactors,
+    ];
+  }
+
+  /**
+   * GET login.awp?gtk=1
+   *
+   * Diagnostic version:
+   * logs only whether GTK/cookies were received.
+   * It NEVER logs their values.
+   */
+  private async bootstrapGtk(): Promise<void> {
+    this.http.clearGtk();
+
+    const res = await this.http.get(
+      loginUrl({
+        gtk: true,
+        version: this.http.version,
+      }),
+    );
+
+    this.http.captureAuthHeaders(res);
+
+    // Some responses carry the GTK in the body instead of a cookie.
+    try {
+      const body =
+        (await res.clone().json()) as RawApiResponse;
+
+      if (body.token) {
+        this.http.setGtk(body.token);
+      }
+    } catch {
+      // Empty / non-JSON bootstrap body.
+    }
+
+    const cookies =
+      this.http.getCookies();
+
+    const gtkCookie =
+      this.http.getCookie("GTK");
+
+    const gtkHeader =
+      this.http.getGtk();
+
+    log(
+      "info",
+      `[GTK DEBUG] Bootstrap HTTP status: ${res.status}`,
+    );
+
+    log(
+      "info",
+      `[GTK DEBUG] Cookies received: ${Object.keys(cookies).length}`,
+    );
+
+    log(
+      "info",
+      `[GTK DEBUG] GTK cookie received: ${gtkCookie ? "yes" : "no"}`,
+    );
+
+    log(
+      "info",
+      `[GTK DEBUG] GTK available for X-GTK: ${
+        gtkHeader || gtkCookie
+          ? "yes"
+          : "no"
+      }`,
+    );
+  }
+
+  private async replayLogin(
+    payload: LoginPayload,
+  ): Promise<RawApiResponse> {
+    await this.bootstrapGtk();
+
+    const res =
+      await this.http.postForm(
+        loginUrl({
+          version:
+            this.http.version,
+        }),
+        payload as unknown as Record<
+          string,
+          unknown
+        >,
+      );
+
+    this.http.captureAuthHeaders(res);
+
+    return (
+      await res.json()
+    ) as RawApiResponse;
+  }
+
+  private getResolvedToken(
+    fallback?: string,
+  ): string {
+    return (
+      this.http.getToken() ??
+      fallback ??
+      ""
+    );
+  }
+
+  private async persistSession(
+    token: string,
+    accounts: AccountInfo[],
+  ): Promise<void> {
+    const accountTokens: Record<
+      number,
+      string
+    > = {};
+
+    for (
+      const [id, t]
+      of this.accountTokens
+    ) {
+      accountTokens[id] = t;
+    }
+
+    const session: StoredSession = {
+      token,
+      cookies:
+        this.http.getCookies(),
+      xGtk:
+        this.http.getGtk(),
+      twoFaToken:
+        this.http.getTwoFaToken(),
+      accounts,
+      ...(Object.keys(
+        accountTokens,
+      ).length > 0
+        ? {
+            accountTokens,
+          }
+        : {}),
+      version:
+        this.http.version,
+      savedAt:
+        new Date().toISOString(),
+    };
+
+    await this.store.saveSession(
+      session,
+      this.activeProfile,
+    );
+  }
+
+  private async ensureProfileIndexed():
+    Promise<void> {
+    if (!this.activeProfile) {
+      return;
+    }
+
+    const index =
+      await this.store.loadProfileIndex();
+
+    if (
+      !index.profiles.includes(
+        this.activeProfile,
+      )
+    ) {
+      index.profiles.push(
+        this.activeProfile,
+      );
+    }
+
+    index.active =
+      this.activeProfile;
+
+    await this.store.saveProfileIndex(
+      index,
+    );
+  }
+}
+
+function normalizeLoginFactors(
+  fa: unknown,
+): LoginFactor[] {
+  if (!Array.isArray(fa)) {
+    return [];
+  }
+
+  return fa.flatMap(
+    (factor) => {
+      const candidate =
+        factor as Record<
+          string,
+          unknown
+        >;
+
+      if (
+        typeof candidate.cn !==
+          "string" ||
+        typeof candidate.cv !==
+          "string"
+      ) {
+        return [];
+      }
+
+      return [
+        {
+          cn: candidate.cn,
+          cv: candidate.cv,
+          ...(typeof candidate.uniq ===
+          "boolean"
+            ? {
+                uniq:
+                  candidate.uniq,
+              }
+            : {}),
+        },
+      ];
+    },
+  );
+}
+
+function buildStoredCredentials(
+  identifiant: string,
+  motdepasse: string,
+  fa?: LoginFactor[],
+): StoredCredentials {
+  const reusableFa =
+    normalizeLoginFactors(fa);
+
+  return {
+    identifiant,
+    motdepasse,
+    ...(reusableFa.length > 0
+      ? {
+          fa: reusableFa,
+        }
+      : {}),
+  };
+}
+
+function extractAccounts(
+  body: RawApiResponse,
+): AccountInfo[] {
+  const data =
+    body.data as
+      | Record<string, unknown>
+      | undefined;
+
+  if (!data) {
+    return [];
+  }
+
+  const accounts =
+    data.accounts as
+      | unknown[]
+      | undefined;
+
+  if (!Array.isArray(accounts)) {
+    return [];
+  }
+
+  return accounts.flatMap(
+    (account) => {
+      const normalized =
+        normalizeAccount(account);
+
+      return normalized
+        ? [normalized]
+        : [];
+    },
+  );
+}
+
+function extractCurrentAccountId(
+  body: RawApiResponse,
+): number | undefined {
+  const data =
+    body.data as
+      | Record<string, unknown>
+      | undefined;
+
+  return typeof data?.id ===
+    "number"
+    ? data.id
+    : undefined;
+}
+
+function applyCurrentAccount(
+  accounts: AccountInfo[],
+  currentAccountId?: number,
+): AccountInfo[] {
+  if (
+    currentAccountId !== undefined
+  ) {
+    return markCurrentAccount(
+      accounts,
+      currentAccountId,
+    );
+  }
+
+  const inferredId =
+    accounts.find(
+      (a) => a.main === true,
+    )?.id ??
+    accounts[0]?.id;
+
+  if (inferredId !== undefined) {
+    return markCurrentAccount(
+      accounts,
+      inferredId,
+    );
+  }
+
+  return accounts;
+}
+
+function markCurrentAccount(
+  accounts: AccountInfo[],
+  currentAccountId: number,
+): AccountInfo[] {
+  return accounts.map(
+    (account) => ({
+      ...account,
+      current:
+        account.id ===
+        currentAccountId,
+    }),
+  );
+}
+
+function normalizeAccount(
+  account: unknown,
+): AccountInfo | undefined {
+  const candidate =
+    account as Record<
+      string,
+      unknown
+    >;
+
+  if (
+    typeof candidate.id !==
+      "number" ||
+    typeof candidate.typeCompte !==
+      "string"
+  ) {
+    return undefined;
+  }
+
+  const firstName =
+    typeof candidate.prenom ===
+    "string"
+      ? candidate.prenom.trim()
+      : "";
+
+  const lastName =
+    typeof candidate.nom ===
+    "string"
+      ? candidate.nom.trim()
+      : "";
+
+  const name =
+    `${firstName} ${lastName}`.trim();
+
+  if (!name) {
+    return undefined;
+  }
+
+  const profile =
+    candidate.profile as
+      | Record<string, unknown>
+      | undefined;
+
+  const students =
+    Array.isArray(
+      profile?.eleves,
+    )
+      ? profile.eleves.flatMap(
+          (student) =>
+            normalizeStudent(
+              student,
+            ),
+        )
+      : undefined;
+
+  const classes =
+    normalizeTeacherClasses(
+      profile,
+    );
+
+  const groups =
+    normalizeTeacherGroups(
+      profile,
+    );
+
+  const subjects =
+    normalizeTeacherSubjects(
+      profile,
+    );
+
+  const modules =
+    normalizeTeacherModules(
+      candidate,
+    );
+
+  return {
+    id: candidate.id,
+    type:
+      candidate.typeCompte,
+    name,
+
+    ...(typeof candidate.nomEtablissement ===
+    "string"
+      ? {
+          establishment:
+            candidate.nomEtablissement,
+        }
+      : {}),
+
+    ...(typeof candidate.idLogin ===
+    "number"
+      ? {
+          idLogin:
+            candidate.idLogin,
+        }
+      : {}),
+
+    ...(typeof candidate.uid ===
+      "string" &&
+    candidate.uid
+      ? {
+          uid: candidate.uid,
+        }
+      : {}),
+
+    ...(typeof candidate.isProfEtPersonnel ===
+    "boolean"
+      ? {
+          isProfEtPersonnel:
+            candidate.isProfEtPersonnel,
+        }
+      : {}),
+
+    ...(typeof candidate.main ===
+    "boolean"
+      ? {
+          main: candidate.main,
+        }
+      : {}),
+
+    ...(typeof candidate.current ===
+    "boolean"
+      ? {
+          current:
+            candidate.current,
+        }
+      : {}),
+
+    ...(students &&
+    students.length > 0
+      ? {
+          students,
+        }
+      : {}),
+
+    ...(classes &&
+    classes.length > 0
+      ? {
+          classes,
+        }
+      : {}),
+
+    ...(groups &&
+    groups.length > 0
+      ? {
+          groups,
+        }
+      : {}),
+
+    ...(subjects &&
+    subjects.length > 0
+      ? {
+          subjects,
+        }
+      : {}),
+
+    ...(modules &&
+    modules.length > 0
+      ? {
+          modules,
+        }
+      : {}),
+  };
+}
+
+function normalizeStudent(
+  student: unknown,
+) {
+  const candidate =
+    student as Record<
+      string,
+      unknown
+    >;
+
+  if (
+    typeof candidate.id !==
+    "number"
+  ) {
+    return [];
+  }
+
+  const firstName =
+    typeof candidate.prenom ===
+    "string"
+      ? candidate.prenom.trim()
+      : "";
+
+  const lastName =
+    typeof candidate.nom ===
+    "string"
+      ? candidate.nom.trim()
+      : "";
+
+  const name =
+    `${firstName} ${lastName}`.trim();
+
+  if (!name) {
+    return [];
+  }
+
+  const classe =
+    candidate.classe as
+      | Record<string, unknown>
+      | undefined;
+
+  return [
+    {
+      id: candidate.id,
+      name,
+
+      ...(typeof classe?.id ===
+      "number"
+        ? {
+            classId:
+              classe.id,
+          }
+        : {}),
+
+      ...(typeof classe?.libelle ===
+      "string"
+        ? {
+            className:
+              classe.libelle,
+          }
+        : {}),
+
+      ...(typeof classe?.code ===
+      "string"
+        ? {
+            classCode:
+              classe.code,
+          }
+        : {}),
+
+      ...(typeof candidate.nomEtablissement ===
+      "string"
+        ? {
+            establishment:
+              candidate.nomEtablissement,
+          }
+        : {}),
+    },
+  ];
+}
+
+function ensureCurrentFlag(
+  accounts?: AccountInfo[],
+): AccountInfo[] {
+  if (
+    !accounts ||
+    accounts.length === 0
+  ) {
+    return accounts ?? [];
+  }
+
+  const hasCurrent =
+    accounts.some(
+      (a) => a.current === true,
+    );
+
+  if (hasCurrent) {
+    return accounts;
+  }
+
+  const inferredId =
+    accounts.find(
+      (a) => a.main === true,
+    )?.id ??
+    accounts[0]?.id;
+
+  if (inferredId !== undefined) {
+    return markCurrentAccount(
+      accounts,
+      inferredId,
+    );
+  }
+
+  return accounts;
+}
+
+function mergeAccountsAfterSwitch(
+  accounts: AccountInfo[],
+  body: RawApiResponse,
+): AccountInfo[] {
+  if (
+    !body.data ||
+    typeof body.data !==
+      "object"
+  ) {
+    return accounts;
+  }
+
+  const data =
+    body.data as Record<
+      string,
+      unknown
+    >;
+
+  const rawAccounts =
+    Array.isArray(
+      data.accounts,
+    )
+      ? data.accounts
+      : undefined;
+
+  if (
+    !rawAccounts ||
+    rawAccounts.length === 0
+  ) {
+    return accounts;
+  }
+
+  const fresh =
+    new Map<
+      number,
+      AccountInfo
+    >();
+
+  for (
+    const raw of rawAccounts
+  ) {
+    const normalized =
+      normalizeAccount(raw);
+
+    if (normalized) {
+      fresh.set(
+        normalized.id,
+        normalized,
+      );
+    }
+  }
+
+  return accounts.map(
+    (existing) => {
+      const update =
+        fresh.get(
+          existing.id,
+        );
+
+      if (!update) {
+        return existing;
+      }
+
+      return {
+        ...existing,
+
+        ...(update.students &&
+        update.students.length > 0
+          ? {
+              students:
+                update.students,
+            }
+          : {}),
+
+        ...(update.establishment
+          ? {
+              establishment:
+                update.establishment,
+            }
+          : {}),
+
+        ...(update.uid
+          ? {
+              uid:
+                update.uid,
+            }
+          : {}),
+
+        ...(update.isProfEtPersonnel !==
+        undefined
+          ? {
+              isProfEtPersonnel:
+                update.isProfEtPersonnel,
+            }
+          : {}),
+
+        ...(update.classes &&
+        update.classes.length > 0
+          ? {
+              classes:
+                update.classes,
+            }
+          : {}),
+
+        ...(update.groups &&
+        update.groups.length > 0
+          ? {
+              groups:
+                update.groups,
+            }
+          : {}),
+
+        ...(update.subjects &&
+        update.subjects.length > 0
+          ? {
+              subjects:
+                update.subjects,
+            }
+          : {}),
+
+        ...(update.modules &&
+        update.modules.length > 0
+          ? {
+              modules:
+                update.modules,
+            }
+          : {}),
+      };
+    },
+  );
+}
+
+// ── Teacher metadata normalization ─────────────────────────────
+
+import type {
+  TeacherClassInfo,
+  TeacherGroupInfo,
+  TeacherSubjectInfo,
+} from "./types.js";
+
+function normalizeTeacherClasses(
+  profile:
+    | Record<string, unknown>
+    | undefined,
+): TeacherClassInfo[] | undefined {
+  const classes =
+    Array.isArray(
+      profile?.classes,
+    )
+      ? profile.classes
+      : [];
+
+  if (classes.length === 0) {
+    return undefined;
+  }
+
+  return classes.flatMap(
+    (entry) => {
+      const c =
+        entry as Record<
+          string,
+          unknown
+        >;
+
+      if (
+        typeof c.id !==
+        "number"
+      ) {
+        return [];
+      }
+
+      return [
+        {
+          id: c.id,
+
+          ...(typeof c.code ===
+          "string"
+            ? {
+                code: c.code,
+              }
+            : {}),
+
+          ...(typeof c.libelle ===
+          "string"
+            ? {
+                label:
+                  c.libelle,
+              }
+            : {}),
+        },
+      ];
+    },
+  );
+}
+
+function normalizeTeacherGroups(
+  profile:
+    | Record<string, unknown>
+    | undefined,
+): TeacherGroupInfo[] | undefined {
+  const groups =
+    Array.isArray(
+      profile?.groupesNiveau,
+    )
+      ? profile.groupesNiveau
+      : [];
+
+  if (groups.length === 0) {
+    return undefined;
+  }
+
+  return groups.flatMap(
+    (entry) => {
+      const g =
+        entry as Record<
+          string,
+          unknown
+        >;
+
+      if (
+        typeof g.id !==
+        "number"
+      ) {
+        return [];
+      }
+
+      return [
+        {
+          id: g.id,
+
+          ...(typeof g.code ===
+          "string"
+            ? {
+                code: g.code,
+              }
+            : {}),
+
+          ...(typeof g.libelle ===
+          "string"
+            ? {
+                label:
+                  g.libelle,
+              }
+            : {}),
+
+          ...(typeof g.idClasse ===
+          "number"
+            ? {
+                classId:
+                  g.idClasse,
+              }
+            : {}),
+
+          ...(typeof g.codeMatiere ===
+          "string"
+            ? {
+                subjectCode:
+                  g.codeMatiere,
+              }
+            : {}),
+        },
+      ];
+    },
+  );
+}
+
+function normalizeTeacherSubjects(
+  profile:
+    | Record<string, unknown>
+    | undefined,
+): TeacherSubjectInfo[] | undefined {
+  const matieres =
+    Array.isArray(
+      profile?.matieres,
+    )
+      ? profile.matieres
+      : [];
+
+  if (
+    matieres.length === 0
+  ) {
+    return undefined;
+  }
+
+  return matieres.flatMap(
+    (entry) => {
+      const m =
+        entry as Record<
+          string,
+          unknown
+        >;
+
+      if (
+        typeof m.code !==
+          "string" ||
+        !m.code.trim()
+      ) {
+        return [];
+      }
+
+      return [
+        {
+          code:
+            m.code.trim(),
+
+          ...(typeof m.libelle ===
+          "string"
+            ? {
+                label:
+                  m.libelle,
+              }
+            : {}),
+        },
+      ];
+    },
+  );
+}
+
+function normalizeTeacherModules(
+  candidate: Record<
+    string,
+    unknown
+  >,
+): string[] | undefined {
+  const modules =
+    Array.isArray(
+      candidate.modules,
+    )
+      ? candidate.modules
+      : [];
+
+  if (
+    modules.length === 0
+  ) {
+    return undefined;
+  }
+
+  const codes =
+    modules.flatMap(
+      (entry) => {
+        const m =
+          entry as Record<
+            string,
+            unknown
+          >;
+
+        if (
+          typeof m.code !==
+            "string" ||
+          !m.code.trim()
+        ) {
+          return [];
+        }
+
+        if (
+          (
+            m as Record<
+              string,
+              unknown
+            >
+          ).enable !== true
+        ) {
+          return [];
+        }
+
+        return [
+          m.code.trim(),
+        ];
+      },
+    );
+
   return codes.length > 0
     ? codes
     : undefined;
