@@ -30,7 +30,7 @@ export class EdHttpClient {
   readonly version: string;
 
   constructor(opts: { version?: string } = {}) {
-    this.version = opts.version ?? "4.101.4";
+    this.version = opts.version ?? "4.103.0";
   }
 
   // ── Cookie jar ───────────────────────────────────────────────
