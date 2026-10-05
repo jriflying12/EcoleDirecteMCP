@@ -7,10 +7,16 @@
 
 import { CONTENT_TYPE_FORM } from "../api/constants.js";
 
-const DEFAULT_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
+const DEFAULT_USER_AGENT =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36";
+
+const ECOLEDIRECTE_REFERER =
+  "https://www.ecoledirecte.com/";
+
 const FETCH_TIMEOUT_MS = 30_000;
 const FETCH_MAX_ATTEMPTS = 3;
 const FETCH_RETRY_BASE_DELAY_MS = 250;
+
 const RETRYABLE_FETCH_ERROR_CODES = new Set([
   "EAI_AGAIN",
   "ECONNABORTED",
@@ -50,12 +56,16 @@ export class EdHttpClient {
   /** Parse `Set-Cookie` header values (simplified; no path/domain handling needed). */
   ingestSetCookieHeaders(headers: Headers): void {
     const raw = headers.getSetCookie?.() ?? [];
+
     for (const line of raw) {
       const [pair] = line.split(";");
       const eqIdx = pair.indexOf("=");
+
       if (eqIdx < 1) continue;
+
       const name = pair.slice(0, eqIdx).trim();
       const value = pair.slice(eqIdx + 1).trim();
+
       this.cookies.set(name, value);
     }
   }
@@ -110,26 +120,60 @@ export class EdHttpClient {
 
   // ── Request helpers ──────────────────────────────────────────
 
-  private commonHeaders(opts: {
-    includeGtk?: boolean;
-    includeToken?: boolean;
-    includeTwoFaToken?: boolean;
-  } = {}): Record<string, string> {
-    const includeGtk = opts.includeGtk ?? true;
-    const includeToken = opts.includeToken ?? true;
-    const includeTwoFaToken = opts.includeTwoFaToken ?? true;
+  private commonHeaders(
+    opts: {
+      includeGtk?: boolean;
+      includeToken?: boolean;
+      includeTwoFaToken?: boolean;
+    } = {},
+  ): Record<string, string> {
+    const includeGtk =
+      opts.includeGtk ?? true;
+
+    const includeToken =
+      opts.includeToken ?? true;
+
+    const includeTwoFaToken =
+      opts.includeTwoFaToken ?? true;
+
     const h: Record<string, string> = {
       "User-Agent": DEFAULT_USER_AGENT,
       Accept: "application/json, text/plain, */*",
+      Referer: ECOLEDIRECTE_REFERER,
     };
-    const cookieStr = this.buildCookieHeader();
-    if (cookieStr) h["Cookie"] = cookieStr;
-    if (includeGtk) {
-      const gtkValue = this.xGtk ?? this.cookies.get("GTK");
-      if (gtkValue) h["X-GTK"] = gtkValue;
+
+    const cookieStr =
+      this.buildCookieHeader();
+
+    if (cookieStr) {
+      h["Cookie"] = cookieStr;
     }
-    if (includeToken && this.xToken) h["X-Token"] = this.xToken;
-    if (includeTwoFaToken && this.twoFaToken) h["2FA-Token"] = this.twoFaToken;
+
+    if (includeGtk) {
+      const gtkValue =
+        this.xGtk ??
+        this.cookies.get("GTK");
+
+      if (gtkValue) {
+        h["X-GTK"] = gtkValue;
+      }
+    }
+
+    if (
+      includeToken &&
+      this.xToken
+    ) {
+      h["X-Token"] = this.xToken;
+    }
+
+    if (
+      includeTwoFaToken &&
+      this.twoFaToken
+    ) {
+      h["2FA-Token"] =
+        this.twoFaToken;
+    }
+
     return h;
   }
 
@@ -139,29 +183,51 @@ export class EdHttpClient {
       .join("; ");
   }
 
-  private async request(url: string, init: RequestInit): Promise<Response> {
-    for (let attempt = 1; attempt <= FETCH_MAX_ATTEMPTS; attempt += 1) {
+  private async request(
+    url: string,
+    init: RequestInit,
+  ): Promise<Response> {
+    for (
+      let attempt = 1;
+      attempt <= FETCH_MAX_ATTEMPTS;
+      attempt += 1
+    ) {
       try {
         return await fetch(url, {
           ...init,
           redirect: "manual",
-          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+          signal: AbortSignal.timeout(
+            FETCH_TIMEOUT_MS
+          ),
         });
       } catch (error) {
-        if (!shouldRetryRequest(error) || attempt >= FETCH_MAX_ATTEMPTS) {
+        if (
+          !shouldRetryRequest(error) ||
+          attempt >= FETCH_MAX_ATTEMPTS
+        ) {
           throw error;
         }
-        await wait(FETCH_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1));
+
+        await wait(
+          FETCH_RETRY_BASE_DELAY_MS *
+            Math.pow(2, attempt - 1)
+        );
       }
     }
 
-    throw new Error("Unreachable request retry state");
+    throw new Error(
+      "Unreachable request retry state"
+    );
   }
 
   /** Plain GET with cookie + GTK headers. */
   async get(
     url: string,
-    opts: { includeGtk?: boolean; includeToken?: boolean; includeTwoFaToken?: boolean } = {},
+    opts: {
+      includeGtk?: boolean;
+      includeToken?: boolean;
+      includeTwoFaToken?: boolean;
+    } = {},
   ): Promise<Response> {
     return this.request(url, {
       method: "GET",
@@ -176,28 +242,57 @@ export class EdHttpClient {
   async postForm(
     url: string,
     data: Record<string, unknown>,
-    opts: { includeGtk?: boolean; includeToken?: boolean; includeTwoFaToken?: boolean } = {},
+    opts: {
+      includeGtk?: boolean;
+      includeToken?: boolean;
+      includeTwoFaToken?: boolean;
+    } = {},
   ): Promise<Response> {
-    const body = `data=${encodeURIComponent(JSON.stringify(data))}`;
+    const body =
+      `data=${encodeURIComponent(
+        JSON.stringify(data)
+      )}`;
+
     return this.request(url, {
       method: "POST",
       headers: {
         ...this.commonHeaders(opts),
-        "Content-Type": CONTENT_TYPE_FORM,
+        "Content-Type":
+          CONTENT_TYPE_FORM,
       },
       body,
     });
   }
 
   /** Extract auth-relevant response headers after a login call. */
-  captureAuthHeaders(res: Response): void {
-    const gtk = res.headers.get("X-GTK");
-    if (gtk) this.xGtk = gtk;
-    const token = res.headers.get("X-Token");
-    if (token) this.xToken = token;
-    const twoFaToken = res.headers.get("2FA-Token");
-    if (twoFaToken) this.twoFaToken = twoFaToken;
-    this.ingestSetCookieHeaders(res.headers);
+  captureAuthHeaders(
+    res: Response
+  ): void {
+    const gtk =
+      res.headers.get("X-GTK");
+
+    if (gtk) {
+      this.xGtk = gtk;
+    }
+
+    const token =
+      res.headers.get("X-Token");
+
+    if (token) {
+      this.xToken = token;
+    }
+
+    const twoFaToken =
+      res.headers.get("2FA-Token");
+
+    if (twoFaToken) {
+      this.twoFaToken =
+        twoFaToken;
+    }
+
+    this.ingestSetCookieHeaders(
+      res.headers
+    );
   }
 
   /** Reset all auth state (cookies, GTK, token). */
@@ -209,21 +304,66 @@ export class EdHttpClient {
   }
 }
 
-function shouldRetryRequest(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  if (error.name === "AbortError" || error.name === "TimeoutError") return true;
-  if (error.message.trim().toLowerCase() === "fetch failed") return true;
+function shouldRetryRequest(
+  error: unknown
+): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
 
-  const code = extractErrorCode(error.cause);
-  return code !== undefined && RETRYABLE_FETCH_ERROR_CODES.has(code);
+  if (
+    error.name === "AbortError" ||
+    error.name === "TimeoutError"
+  ) {
+    return true;
+  }
+
+  if (
+    error.message
+      .trim()
+      .toLowerCase() ===
+    "fetch failed"
+  ) {
+    return true;
+  }
+
+  const code =
+    extractErrorCode(error.cause);
+
+  return (
+    code !== undefined &&
+    RETRYABLE_FETCH_ERROR_CODES.has(
+      code
+    )
+  );
 }
 
-function extractErrorCode(cause: unknown): string | undefined {
-  if (!cause || typeof cause !== "object") return undefined;
-  const record = cause as Record<string, unknown>;
-  return typeof record.code === "string" ? record.code : undefined;
+function extractErrorCode(
+  cause: unknown
+): string | undefined {
+  if (
+    !cause ||
+    typeof cause !== "object"
+  ) {
+    return undefined;
+  }
+
+  const record =
+    cause as Record<
+      string,
+      unknown
+    >;
+
+  return typeof record.code ===
+    "string"
+    ? record.code
+    : undefined;
 }
 
-function wait(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function wait(
+  ms: number
+): Promise<void> {
+  return new Promise((resolve) =>
+    setTimeout(resolve, ms)
+  );
 }
