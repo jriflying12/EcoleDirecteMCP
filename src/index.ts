@@ -13,8 +13,15 @@ import { EdHttpClient } from "./ecoledirecte/http/client.js";
 import { AuthService } from "./ecoledirecte/auth/service.js";
 import { FileAuthStore } from "./ecoledirecte/auth/fileStore.js";
 import { EdDataService } from "./ecoledirecte/data/service.js";
+
 import { registerDataTools } from "./server/dataTools.js";
 import { registerTools } from "./server/tools.js";
+
+import {
+  registerOAuthRoutes,
+  isValidOAuthToken,
+} from "./server/oauth.js";
+
 import { log } from "./ecoledirecte/logging.js";
 
 async function main(): Promise<void> {
@@ -42,13 +49,18 @@ async function main(): Promise<void> {
     log("info", `Auth restore result: ${restored.status}`);
 
     if (restored.status === "error") {
-      log("warn", `Restore ended in error: ${restored.message}`);
+      log(
+        "warn",
+        `Restore ended in error: ${restored.message}`
+      );
     }
   } catch (err) {
     log(
       "warn",
       `Session restore failed: ${
-        err instanceof Error ? err.message : String(err)
+        err instanceof Error
+          ? err.message
+          : String(err)
       }`
     );
   }
@@ -61,6 +73,7 @@ async function main(): Promise<void> {
 
   app.use(express.json());
 
+  // Railway health check
   app.get("/", (_req, res) => {
     res.status(200).json({
       status: "ok",
@@ -69,26 +82,34 @@ async function main(): Promise<void> {
   });
 
   // ---------------------------------------------------------------------------
-  // Temporary Bearer authentication
+  // OAuth
   // ---------------------------------------------------------------------------
 
-  function isAuthorized(req: express.Request): boolean {
-    const apiKey = process.env.MCP_API_KEY;
+  registerOAuthRoutes(app);
 
-    if (!apiKey) {
-      return false;
-    }
-
-    const authorization = req.headers.authorization;
-
-    return authorization === `Bearer ${apiKey}`;
-  }
-
+  /*
+   * Protect the MCP resource with OAuth.
+   *
+   * When Claude accesses /mcp without a valid access token,
+   * advertise the Protected Resource Metadata endpoint so that
+   * Claude can discover the OAuth authorization server.
+   */
   app.use("/mcp", (req, res, next) => {
-    if (!isAuthorized(req)) {
+    if (!isValidOAuthToken(req)) {
+      const baseUrl = (
+        process.env.MCP_PUBLIC_URL ||
+        `${req.protocol}://${req.get("host")}`
+      ).replace(/\/$/, "");
+
+      res.setHeader(
+        "WWW-Authenticate",
+        `Bearer resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`
+      );
+
       res.status(401).json({
         error: "Unauthorized",
       });
+
       return;
     }
 
@@ -111,7 +132,12 @@ async function main(): Promise<void> {
     return server;
   }
 
-  // Each MCP session must keep its own transport.
+  /*
+   * Streamable HTTP is sessionful here.
+   *
+   * Each initialized MCP session keeps its transport so subsequent
+   * POST / GET / DELETE requests can use the same session.
+   */
   const transports = new Map<
     string,
     StreamableHTTPServerTransport
@@ -124,11 +150,14 @@ async function main(): Promise<void> {
   app.post("/mcp", async (req, res) => {
     try {
       const sessionId =
-        req.headers["mcp-session-id"] as string | undefined;
+        req.headers["mcp-session-id"] as
+          | string
+          | undefined;
 
       // Existing MCP session
       if (sessionId) {
-        const transport = transports.get(sessionId);
+        const transport =
+          transports.get(sessionId);
 
         if (!transport) {
           res.status(404).json({
@@ -139,47 +168,67 @@ async function main(): Promise<void> {
             },
             id: null,
           });
+
           return;
         }
 
-        await transport.handleRequest(req, res, req.body);
+        await transport.handleRequest(
+          req,
+          res,
+          req.body
+        );
+
         return;
       }
 
-      // New MCP session
+      // A request without a session must be an initialize request.
       if (!isInitializeRequest(req.body)) {
         res.status(400).json({
           jsonrpc: "2.0",
           error: {
             code: -32000,
-            message: "Bad Request: Session ID required",
+            message:
+              "Bad Request: Session ID required",
           },
           id: null,
         });
+
         return;
       }
 
-      let transport: StreamableHTTPServerTransport;
+      let transport:
+        StreamableHTTPServerTransport;
 
-      transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => randomUUID(),
+      transport =
+        new StreamableHTTPServerTransport({
+          sessionIdGenerator: () =>
+            randomUUID(),
 
-        onsessioninitialized: (newSessionId) => {
-          transports.set(newSessionId, transport);
+          onsessioninitialized: (
+            newSessionId
+          ) => {
+            transports.set(
+              newSessionId,
+              transport
+            );
 
-          log(
-            "info",
-            `MCP session initialized: ${newSessionId}`
-          );
-        },
-      });
+            log(
+              "info",
+              `MCP session initialized: ${newSessionId}`
+            );
+          },
+        });
 
       transport.onclose = () => {
         const id = transport.sessionId;
 
         if (id) {
           transports.delete(id);
-          log("info", `MCP session closed: ${id}`);
+
+          log(
+            "info",
+            `MCP session closed: ${id}`
+          );
         }
       };
 
@@ -196,7 +245,9 @@ async function main(): Promise<void> {
       log(
         "error",
         `MCP POST error: ${
-          err instanceof Error ? err.message : String(err)
+          err instanceof Error
+            ? err.message
+            : String(err)
         }`
       );
 
@@ -205,7 +256,8 @@ async function main(): Promise<void> {
           jsonrpc: "2.0",
           error: {
             code: -32603,
-            message: "Internal server error",
+            message:
+              "Internal server error",
           },
           id: null,
         });
@@ -215,77 +267,138 @@ async function main(): Promise<void> {
 
   // ---------------------------------------------------------------------------
   // GET /mcp
-  //
-  // Used for the server-to-client SSE stream.
   // ---------------------------------------------------------------------------
 
   app.get("/mcp", async (req, res) => {
-    const sessionId =
-      req.headers["mcp-session-id"] as string | undefined;
+    try {
+      const sessionId =
+        req.headers["mcp-session-id"] as
+          | string
+          | undefined;
 
-    if (!sessionId) {
-      res.status(400).json({
-        error: "Missing MCP session ID",
-      });
-      return;
+      if (!sessionId) {
+        res.status(400).json({
+          error:
+            "Missing MCP session ID",
+        });
+
+        return;
+      }
+
+      const transport =
+        transports.get(sessionId);
+
+      if (!transport) {
+        res.status(404).json({
+          error:
+            "MCP session not found",
+        });
+
+        return;
+      }
+
+      await transport.handleRequest(
+        req,
+        res
+      );
+    } catch (err) {
+      log(
+        "error",
+        `MCP GET error: ${
+          err instanceof Error
+            ? err.message
+            : String(err)
+        }`
+      );
+
+      if (!res.headersSent) {
+        res.status(500).json({
+          error:
+            "Internal server error",
+        });
+      }
     }
-
-    const transport = transports.get(sessionId);
-
-    if (!transport) {
-      res.status(404).json({
-        error: "MCP session not found",
-      });
-      return;
-    }
-
-    await transport.handleRequest(req, res);
   });
 
   // ---------------------------------------------------------------------------
   // DELETE /mcp
-  //
-  // Allows the MCP client to explicitly terminate a session.
   // ---------------------------------------------------------------------------
 
   app.delete("/mcp", async (req, res) => {
-    const sessionId =
-      req.headers["mcp-session-id"] as string | undefined;
+    try {
+      const sessionId =
+        req.headers["mcp-session-id"] as
+          | string
+          | undefined;
 
-    if (!sessionId) {
-      res.status(400).json({
-        error: "Missing MCP session ID",
-      });
-      return;
+      if (!sessionId) {
+        res.status(400).json({
+          error:
+            "Missing MCP session ID",
+        });
+
+        return;
+      }
+
+      const transport =
+        transports.get(sessionId);
+
+      if (!transport) {
+        res.status(404).json({
+          error:
+            "MCP session not found",
+        });
+
+        return;
+      }
+
+      await transport.handleRequest(
+        req,
+        res
+      );
+    } catch (err) {
+      log(
+        "error",
+        `MCP DELETE error: ${
+          err instanceof Error
+            ? err.message
+            : String(err)
+        }`
+      );
+
+      if (!res.headersSent) {
+        res.status(500).json({
+          error:
+            "Internal server error",
+        });
+      }
     }
-
-    const transport = transports.get(sessionId);
-
-    if (!transport) {
-      res.status(404).json({
-        error: "MCP session not found",
-      });
-      return;
-    }
-
-    await transport.handleRequest(req, res);
   });
 
   // ---------------------------------------------------------------------------
-  // Start
+  // Start server
   // ---------------------------------------------------------------------------
 
-  const port = Number(process.env.PORT || 3000);
+  const port = Number(
+    process.env.PORT || 3000
+  );
 
-  app.listen(port, "0.0.0.0", () => {
-    log(
-      "info",
-      `EcoleDirecte MCP listening on port ${port}`
-    );
-  });
+  app.listen(
+    port,
+    "0.0.0.0",
+    () => {
+      log(
+        "info",
+        `EcoleDirecte MCP listening on port ${port}`
+      );
+    }
+  );
 }
 
 main().catch((err) => {
-  process.stderr.write(`Fatal: ${err}\n`);
+  process.stderr.write(
+    `Fatal: ${err}\n`
+  );
+
   process.exit(1);
 });
