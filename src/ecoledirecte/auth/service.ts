@@ -248,6 +248,9 @@ if (reusableFa.length > 0) {
 const res = await this.http.postForm(
   postUrl,
   payload as unknown as Record<string, unknown>,
+  {
+    includeCookies: false,
+  },
 );
 
 log(
@@ -1474,18 +1477,13 @@ const result =
   ): Promise<RawApiResponse> {
     await this.bootstrapGtk();
 
-    const res =
-      await this.http.postForm(
-        loginUrl({
-          version:
-            this.http.version,
-        }),
-        payload as unknown as Record<
-          string,
-          unknown
-        >,
-      );
-
+    const res = await this.http.postForm(
+  postUrl,
+  payload as unknown as Record<string, unknown>,
+  {
+    includeCookies: false,
+  },
+  );
     this.http.captureAuthHeaders(res);
 
     return (
