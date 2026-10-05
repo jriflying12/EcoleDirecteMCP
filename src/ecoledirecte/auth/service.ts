@@ -11,6 +11,7 @@
  */
 
 import { EdHttpClient } from "../http/client.js";
+import { log } from "../logging.js";
 import { doubleAuthUrl, loginUrl, probeUrl, renewTokenUrl, switchRoleUrl } from "../api/constants.js";
 import { ApiCode, normalizeLoginResponse, normalizeProbeResponse, type RawApiResponse } from "../api/normalize.js";
 import type { AuthStore } from "./store.js";
@@ -208,6 +209,10 @@ export class AuthService {
       const body =
         (await res.json()) as RawApiResponse;
 
+      log("info", "EcoleDirecte login result", {
+        apiCode: typeof body.code === "number" ? body.code : null,
+        factorCount: reusableFa.length,
+      });
       const result =
         normalizeLoginResponse(body);
 
@@ -244,6 +249,7 @@ export class AuthService {
             reusableFa.length > 0 &&
             body.code === ApiCode.INVALID_CREDENTIALS
           ) {
+            log("info", "EcoleDirecte retrying login without remembered factors");
             return this.performLogin(
               identifiant,
               motdepasse,
@@ -583,6 +589,10 @@ export class AuthService {
 
       const probe =
         normalizeProbeResponse(body);
+      log("info", "EcoleDirecte session validation result", {
+        apiCode: typeof body.code === "number" ? body.code : null,
+        valid: probe.valid,
+      });
 
       if (probe.valid) {
         const resolvedToken =
@@ -1031,6 +1041,7 @@ export class AuthService {
         );
 
       if (session) {
+        log("info", "EcoleDirecte restoring persisted session");
         this.http.loadCookies(
           session.cookies,
         );
@@ -1085,6 +1096,7 @@ export class AuthService {
         );
 
       if (creds) {
+        log("info", "EcoleDirecte logging in from stored credentials");
         return this.login(
           creds.identifiant,
           creds.motdepasse,

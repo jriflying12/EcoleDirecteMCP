@@ -372,3 +372,41 @@ describe("EdHttpClient", () => {
     });
   });
 });
+
+describe("safe authentication diagnostics", () => {
+  it("reports stages and numeric codes without logging auth values or response messages", async () => {
+    const originalFetch = globalThis.fetch;
+    const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    vi.stubEnv("LOG_LEVEL", "info");
+    const sensitive = ["synthetic-username", "synthetic-password", "synthetic-factor-cn",
+      "synthetic-factor-cv", "synthetic-gtk", "synthetic-session", "synthetic-token", "synthetic-2fa"];
+    globalThis.fetch = (async () => new Response(JSON.stringify({ message: sensitive.join(" ") }), {
+      headers: {
+        "X-Code": "505", "X-GTK": sensitive[4], "X-Token": sensitive[6], "2FA-Token": sensitive[7],
+        "Set-Cookie": `GTK=${sensitive[4]}; Path=/`,
+      },
+    })) as typeof fetch;
+    try {
+      const client = new EdHttpClient();
+      const bootstrap = await client.get("https://api.ecoledirecte.com/v3/login.awp?gtk=1");
+      client.captureAuthHeaders(bootstrap);
+      client.setCookie("SESSION", sensitive[5]);
+      await client.postForm("https://api.ecoledirecte.com/v3/login.awp", {
+        identifiant: sensitive[0], motdepasse: sensitive[1],
+        fa: [{ cn: sensitive[2], cv: sensitive[3], uniq: false }],
+      });
+      const output = write.mock.calls.map(call => String(call[0])).join("");
+      for (const value of sensitive) expect(output.includes(value)).toBe(false);
+      expect(output).toContain('"stage":"bootstrap"');
+      expect(output).toContain('"stage":"login"');
+      expect(output).toContain('"factorCount":1');
+      expect(output).toContain('"apiHeaderCode":505');
+      expect(output).toContain('"cookiesPresent":true');
+      expect(output).toContain('"gtkPresent":true');
+    } finally {
+      globalThis.fetch = originalFetch;
+      write.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+});

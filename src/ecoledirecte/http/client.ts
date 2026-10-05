@@ -6,6 +6,7 @@
  */
 
 import { CONTENT_TYPE_FORM } from "../api/constants.js";
+import { log } from "../logging.js";
 
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36";
@@ -200,19 +201,48 @@ export class EdHttpClient {
     url: string,
     init: RequestInit,
   ): Promise<Response> {
+    const endpoint = new URL(url);
+    const isLogin = endpoint.pathname.endsWith("/login.awp");
+    const stage = endpoint.searchParams.get("gtk") === "1" ? "bootstrap" : "login";
     for (
       let attempt = 1;
       attempt <= FETCH_MAX_ATTEMPTS;
       attempt += 1
     ) {
       try {
-        return await fetch(url, {
+        if (isLogin) {
+          const headers = new Headers(init.headers);
+          log("info", "EcoleDirecte auth request", {
+            stage,
+            attempt,
+            method: init.method,
+            version: this.version,
+            cookiesPresent: headers.has("Cookie"),
+            gtkPresent: headers.has("X-GTK"),
+            gtkSource: !headers.has("X-GTK") ? "absent" : this.xGtk !== undefined ? "captured" : "cookie",
+            gtkCookieEncoded: /%[0-9a-f]{2}/i.test(this.cookies.get("GTK") ?? ""),
+          });
+        }
+        const response = await fetch(url, {
           ...init,
           redirect: "manual",
           signal: AbortSignal.timeout(
             FETCH_TIMEOUT_MS
           ),
         });
+        if (isLogin) {
+          const code = response.headers.get("X-Code");
+          log("info", "EcoleDirecte auth response", {
+            stage,
+            httpStatus: response.status,
+            apiHeaderCode: code !== null && /^\d{3}$/.test(code) ? Number(code) : null,
+            gtkHeaderPresent: response.headers.has("X-GTK"),
+            sessionTokenPresent: response.headers.has("X-Token"),
+            twoFaTokenPresent: response.headers.has("2FA-Token"),
+            cookieCount: response.headers.getSetCookie?.().length ?? 0,
+          });
+        }
+        return response;
       } catch (error) {
         if (
           !shouldRetryRequest(error) ||
@@ -262,6 +292,14 @@ export class EdHttpClient {
       includeCookies?: boolean;
     } = {},
   ): Promise<Response> {
+    if (new URL(url).pathname.endsWith("/login.awp")) {
+      log("info", "EcoleDirecte login payload metadata", {
+        usernamePresent: typeof data.identifiant === "string" && data.identifiant.length > 0,
+        passwordPresent: typeof data.motdepasse === "string" && data.motdepasse.length > 0,
+        factorCount: Array.isArray(data.fa) ? data.fa.length : 0,
+        challengePresent: typeof data.cn === "string" && typeof data.cv === "string",
+      });
+    }
     const body =
       `data=${encodeURIComponent(
         JSON.stringify(data)
