@@ -1,6 +1,6 @@
 # EcoleDirecte MCP Server
 
-Local [Model Context Protocol](https://modelcontextprotocol.io/) server (stdio) for [EcoleDirecte](https://www.ecoledirecte.com) — the French platform used by students, families, and teachers for homework, messaging, calendars, and more.
+Remote HTTP [Model Context Protocol](https://modelcontextprotocol.io/) server with OAuth for [EcoleDirecte](https://www.ecoledirecte.com) — the French platform used by students, families, and teachers for homework, messaging, calendars, and more.
 
 ## Features (v0.1)
 
@@ -51,25 +51,38 @@ Local [Model Context Protocol](https://modelcontextprotocol.io/) server (stdio) 
 ## Quick Start
 
 ```bash
-npm install
+npm ci
 npm run build
+npm run lint
+npm test
+npm start
 ```
 
-### Use with an MCP client
+### Railway and Claude
 
-Configure your MCP client to launch this server via stdio:
+Use the existing Railway project. The build command is `npm run build` and the
+start command is `npm start`. Keep development dependencies available during the
+build so TypeScript and Express types are installed. The HTTP server listens on
+Railway's injected `PORT`; `/` is the health endpoint and `/mcp` is the MCP endpoint.
 
-```json
-{
-  "mcpServers": {
-    "ecoledirecte": {
-      "command": "node",
-      "args": ["dist/index.js"],
-      "cwd": "/path/to/EcoleDirecteMCP"
-    }
-  }
-}
-```
+Set `MCP_PUBLIC_URL` to the deployed HTTPS base URL and supply
+`MCP_OAUTH_PASSWORD` securely in Railway variables. Connect Claude to the `/mcp`
+URL and complete OAuth. OAuth clients and tokens are held in memory, so a restart
+can require reconnecting Claude.
+
+Mount the persistent auth volume at `/data` and set `ECOLEDIRECTE_AUTH_DIR=/data`.
+Supply `ECOLEDIRECTE_USERNAME` and `ECOLEDIRECTE_PASSWORD` securely; optional
+`ECOLEDIRECTE_FA_CN` and `ECOLEDIRECTE_FA_CV` provide a remembered factor. Startup
+synchronizes them to the auth store without trimming the password, then restores
+or validates a stored session, falling back to login when needed.
+
+Login POSTs retain X-GTK but omit cookies, matching the supplied successful browser
+trace. Cookies remain available for other API requests. A 505 with remembered
+factors triggers one existing fallback without them; a single startup can thus
+send two login POSTs. Avoid repeated restarts or login calls after a rejection.
+Local protocol tests use synthetic data and do not establish successful live
+EcoleDirecte authentication from Railway. Never share credential or token values
+when diagnosing a deployment; use HTTP status, API code and presence flags.
 
 ### Credentials file
 

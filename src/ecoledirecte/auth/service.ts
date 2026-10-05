@@ -13,7 +13,6 @@
 import { EdHttpClient } from "../http/client.js";
 import { doubleAuthUrl, loginUrl, probeUrl, renewTokenUrl, switchRoleUrl } from "../api/constants.js";
 import { ApiCode, normalizeLoginResponse, normalizeProbeResponse, type RawApiResponse } from "../api/normalize.js";
-import { log } from "../logging.js";
 import type { AuthStore } from "./store.js";
 import type {
   AuthState,
@@ -194,87 +193,23 @@ export class AuthService {
       this.pendingPayload = payload;
 
       const postUrl = loginUrl({
-  version: this.http.version,
-});
+        version: this.http.version,
+      });
 
-// Safe login diagnostics — never log secret values.
-log(
-  "info",
-  `[LOGIN DEBUG] URL: ${postUrl}`,
-);
+      const res = await this.http.postForm(
+        postUrl,
+        payload as unknown as Record<string, unknown>,
+        // Match the browser login: X-GTK is sent without bootstrap cookies.
+        { includeCookies: false },
+      );
 
-log(
-  "info",
-  `[LOGIN DEBUG] identifiant present: ${identifiant.length > 0 ? "yes" : "no"}`,
-);
+      this.http.captureAuthHeaders(res);
 
-log(
-  "info",
-  `[LOGIN DEBUG] password present: ${motdepasse.length > 0 ? "yes" : "no"}`,
-);
+      const body =
+        (await res.json()) as RawApiResponse;
 
-log(
-  "info",
-  `[LOGIN DEBUG] isReLogin: ${payload.isReLogin}`,
-);
-
-log(
-  "info",
-  `[LOGIN DEBUG] uuid: ${payload.uuid ? "present" : "empty"}`,
-);
-
-log(
-  "info",
-  `[LOGIN DEBUG] fa count: ${reusableFa.length}`,
-);
-
-if (reusableFa.length > 0) {
-  log(
-    "info",
-    `[LOGIN DEBUG] fa[0].cn present: ${reusableFa[0]?.cn ? "yes" : "no"}`,
-  );
-
-  log(
-    "info",
-    `[LOGIN DEBUG] fa[0].cv present: ${reusableFa[0]?.cv ? "yes" : "no"}`,
-  );
-
-  log(
-    "info",
-    `[LOGIN DEBUG] fa[0].uniq: ${reusableFa[0]?.uniq ?? "missing"}`,
-  );
-}
-
-const res = await this.http.postForm(
-  postUrl,
-  payload as unknown as Record<string, unknown>,
-  {
-    includeCookies: false,
-  },
-);
-
-log(
-  "info",
-  `[LOGIN DEBUG] HTTP status: ${res.status}`,
-);
-
-this.http.captureAuthHeaders(res);
-
-const body =
-  (await res.json()) as RawApiResponse;
-
-log(
-  "info",
-  `[LOGIN DEBUG] API code: ${String(body.code)}`,
-);
-
-log(
-  "info",
-  `[LOGIN DEBUG] API message: ${body.message ?? "(none)"}`,
-);
-
-const result =
-  normalizeLoginResponse(body);
+      const result =
+        normalizeLoginResponse(body);
 
       switch (result.nextState) {
         case "authenticated": {
@@ -1407,13 +1342,7 @@ const result =
     ];
   }
 
-  /**
-   * GET login.awp?gtk=1
-   *
-   * Diagnostic version:
-   * logs only whether GTK/cookies were received.
-   * It NEVER logs their values.
-   */
+  /** Refresh GTK before an initial login or challenge continuation. */
   private async bootstrapGtk(): Promise<void> {
     this.http.clearGtk();
 
@@ -1437,39 +1366,6 @@ const result =
     } catch {
       // Empty / non-JSON bootstrap body.
     }
-
-    const cookies =
-      this.http.getCookies();
-
-    const gtkCookie =
-      this.http.getCookie("GTK");
-
-    const gtkHeader =
-      this.http.getGtk();
-
-    log(
-      "info",
-      `[GTK DEBUG] Bootstrap HTTP status: ${res.status}`,
-    );
-
-    log(
-      "info",
-      `[GTK DEBUG] Cookies received: ${Object.keys(cookies).length}`,
-    );
-
-    log(
-      "info",
-      `[GTK DEBUG] GTK cookie received: ${gtkCookie ? "yes" : "no"}`,
-    );
-
-    log(
-      "info",
-      `[GTK DEBUG] GTK available for X-GTK: ${
-        gtkHeader || gtkCookie
-          ? "yes"
-          : "no"
-      }`,
-    );
   }
 
   private async replayLogin(
@@ -1477,13 +1373,19 @@ const result =
   ): Promise<RawApiResponse> {
     await this.bootstrapGtk();
 
-    const res = await this.http.postForm(
-  postUrl,
-  payload as unknown as Record<string, unknown>,
-  {
-    includeCookies: false,
-  },
-  );
+    const res =
+      await this.http.postForm(
+        loginUrl({
+          version:
+            this.http.version,
+        }),
+        payload as unknown as Record<
+          string,
+          unknown
+        >,
+        { includeCookies: false },
+      );
+
     this.http.captureAuthHeaders(res);
 
     return (

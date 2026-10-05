@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { AuthService } from "../../src/ecoledirecte/auth/service.js";
-import type { EdHttpClient } from "../../src/ecoledirecte/http/client.js";
+import { EdHttpClient } from "../../src/ecoledirecte/http/client.js";
 import type { AuthStore } from "../../src/ecoledirecte/auth/store.js";
 import type { StoredSession } from "../../src/ecoledirecte/auth/types.js";
 import { ApiCode, type RawApiResponse } from "../../src/ecoledirecte/api/normalize.js";
@@ -391,6 +391,7 @@ describe("AuthService", () => {
         expect.objectContaining({
           fa: [{ cv: "123456", cn: "" }],
         }),
+        { includeCookies: false },
       );
       expect(store.saveCredentials).toHaveBeenCalledWith({ identifiant: "user", motdepasse: "pass" }, undefined);
     });
@@ -483,6 +484,7 @@ describe("AuthService", () => {
           uuid: "",
           fa: doubleAuthReplayFa(),
         },
+        { includeCookies: false },
       );
       expect(http.postForm).toHaveBeenNthCalledWith(
         3,
@@ -838,11 +840,13 @@ describe("AuthService", () => {
         1,
         expect.stringContaining("/v3/login.awp?v=4.96.3"),
         expect.objectContaining({ fa: staleFa }),
+        { includeCookies: false },
       );
       expect(http.postForm).toHaveBeenNthCalledWith(
         2,
         expect.stringContaining("/v3/login.awp?v=4.96.3"),
         expect.objectContaining({ fa: [] }),
+        { includeCookies: false },
       );
       expect(store.saveCredentials).toHaveBeenCalledWith({ identifiant: "user", motdepasse: "pass" }, undefined);
     });
@@ -1441,4 +1445,95 @@ describe("AuthService", () => {
       });
     });
   });
+});
+
+// Exercise AuthService through the real HTTP serializer, without network access.
+describe("browser login wire protocol", () => {
+  it.each(["direct", "stale-factor", "totp", "doubleauth"] as const)(
+    "%s login retains GTK but omits cookies, then restores cookie use for data requests",
+    async (flow) => {
+      const originalFetch = globalThis.fetch;
+      const http = new EdHttpClient();
+      const store = makeStore();
+      const svc = new AuthService(http, store);
+      const requests: Array<{ url: URL; init: RequestInit; headers: Headers }> = [];
+      let bootstraps = 0;
+      let logins = 0;
+      const response = (body: RawApiResponse, headers: HeadersInit = {}) =>
+        new Response(JSON.stringify(body), { headers });
+      globalThis.fetch = (async (input, init = {}) => {
+        const url = new URL(String(input));
+        requests.push({ url, init, headers: new Headers(init.headers) });
+        if (url.searchParams.get("gtk") === "1") {
+          bootstraps++;
+          const headers = new Headers();
+          headers.append("Set-Cookie", `GTK=synthetic-gtk-${bootstraps}; Path=/`);
+          headers.append("Set-Cookie", "SESSION=synthetic-session; Path=/");
+          return response({ code: 200, token: "", message: "" }, headers);
+        }
+        if (url.pathname.endsWith("/login.awp")) {
+          logins++;
+          if (logins === 1 && flow !== "direct") {
+            if (flow === "stale-factor") return response(errorBody(ApiCode.INVALID_CREDENTIALS));
+            return response(flow === "totp" ? totpLoginBody() : doubleAuthLoginBody(), {
+              "X-Token": "synthetic-intermediate", "2FA-Token": "synthetic-intermediate-2fa",
+            });
+          }
+          return response(successBody(), {
+            "X-Token": "synthetic-final", "2FA-Token": "synthetic-final-2fa",
+          });
+        }
+        if (url.pathname.endsWith("/doubleauth.awp")) {
+          return response(url.searchParams.get("verbe") === "get"
+            ? doubleAuthQuestionBody() : doubleAuthAnswerBody());
+        }
+        return response(probeBody());
+      }) as typeof fetch;
+      try {
+        // Entirely synthetic fixtures; special characters test form encoding and whitespace preservation.
+        const password = " synthetic +&%=é "
+        const factors = [{ cn: "synthetic-cn", cv: "synthetic-cv", uniq: false }];
+        let result = await svc.login("synthetic-user", password,
+          flow === "direct" || flow === "stale-factor" ? factors : undefined);
+        if (flow === "totp") result = await svc.submitTotp("000000");
+        if (flow === "doubleauth") result = await svc.submitDoubleAuthChoice(1);
+        expect(result.status).toBe("authenticated");
+        expect(bootstraps).toBe(flow === "direct" ? 1 : 2);
+        expect(logins).toBe(flow === "direct" ? 1 : 2);
+        const loginRequests = requests.filter(r =>
+          r.url.pathname.endsWith("/login.awp") && r.init.method === "POST");
+        for (const [index, request] of loginRequests.entries()) {
+          expect(request.url.searchParams.get("v")).toBe("4.103.0");
+          expect(request.headers.has("Cookie")).toBe(false);
+          expect(request.headers.get("X-GTK")).toBe(`synthetic-gtk-${index + 1}`);
+          expect(request.headers.get("Content-Type")).toBe("application/x-www-form-urlencoded");
+          expect(request.init.redirect).toBe("manual");
+          const form = new URLSearchParams(String(request.init.body));
+          expect([...form.keys()]).toEqual(["data"]);
+          const payload = JSON.parse(form.get("data")!);
+          expect(payload.identifiant).toBe("synthetic-user");
+          expect(payload.motdepasse).toBe(password);
+          expect(payload.isReLogin).toBe(false);
+          expect(payload.uuid).toBe("");
+          if (flow === "direct") expect(payload.fa).toEqual(factors);
+          if (flow === "stale-factor") expect(payload.fa).toEqual(index === 0 ? factors : []);
+          if (flow === "totp" && index === 1) expect(payload.fa).toEqual([{ cn: "", cv: "000000" }]);
+          if (flow === "doubleauth" && index === 1) {
+            expect(payload).toMatchObject({ cn: "cn-token", cv: "cv-token", fa: doubleAuthReplayFa() });
+          }
+        }
+        expect((await svc.validateSession()).status).toBe("authenticated");
+        const dataRequest = requests.at(-1)!;
+        expect(dataRequest.headers.get("Cookie")).toContain(`GTK=synthetic-gtk-${bootstraps}`);
+        expect(dataRequest.headers.get("Cookie")).toContain("SESSION=synthetic-session");
+        expect(dataRequest.headers.get("X-Token")).toBe("synthetic-final");
+        expect(dataRequest.headers.get("2FA-Token")).toBe("synthetic-final-2fa");
+        expect(store.saveSession).toHaveBeenCalledWith(expect.objectContaining({
+          cookies: { GTK: `synthetic-gtk-${bootstraps}`, SESSION: "synthetic-session" },
+        }), undefined);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    },
+  );
 });

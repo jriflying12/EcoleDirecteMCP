@@ -105,8 +105,8 @@ describe("EdHttpClient", () => {
   });
 
   describe("version", () => {
-    it("defaults to 4.101.4", () => {
-      expect(new EdHttpClient().version).toBe("4.101.4");
+    it("defaults to 4.103.0", () => {
+      expect(new EdHttpClient().version).toBe("4.103.0");
     });
 
     it("accepts custom version", () => {
@@ -205,7 +205,7 @@ describe("EdHttpClient", () => {
       const fetchMock = async (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
         const headers = new Headers(init?.headers);
         expect(headers.get("user-agent")).toBe(
-          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36",
         );
         return new Response("{}", {
           status: 200,
