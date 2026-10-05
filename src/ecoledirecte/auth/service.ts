@@ -194,21 +194,84 @@ export class AuthService {
       this.pendingPayload = payload;
 
       const postUrl = loginUrl({
-        version: this.http.version,
-      });
+  version: this.http.version,
+});
 
-      const res = await this.http.postForm(
-        postUrl,
-        payload as unknown as Record<string, unknown>,
-      );
+// Safe login diagnostics — never log secret values.
+log(
+  "info",
+  `[LOGIN DEBUG] URL: ${postUrl}`,
+);
 
-      this.http.captureAuthHeaders(res);
+log(
+  "info",
+  `[LOGIN DEBUG] identifiant present: ${identifiant.length > 0 ? "yes" : "no"}`,
+);
 
-      const body =
-        (await res.json()) as RawApiResponse;
+log(
+  "info",
+  `[LOGIN DEBUG] password present: ${motdepasse.length > 0 ? "yes" : "no"}`,
+);
 
-      const result =
-        normalizeLoginResponse(body);
+log(
+  "info",
+  `[LOGIN DEBUG] isReLogin: ${payload.isReLogin}`,
+);
+
+log(
+  "info",
+  `[LOGIN DEBUG] uuid: ${payload.uuid ? "present" : "empty"}`,
+);
+
+log(
+  "info",
+  `[LOGIN DEBUG] fa count: ${reusableFa.length}`,
+);
+
+if (reusableFa.length > 0) {
+  log(
+    "info",
+    `[LOGIN DEBUG] fa[0].cn present: ${reusableFa[0]?.cn ? "yes" : "no"}`,
+  );
+
+  log(
+    "info",
+    `[LOGIN DEBUG] fa[0].cv present: ${reusableFa[0]?.cv ? "yes" : "no"}`,
+  );
+
+  log(
+    "info",
+    `[LOGIN DEBUG] fa[0].uniq: ${reusableFa[0]?.uniq ?? "missing"}`,
+  );
+}
+
+const res = await this.http.postForm(
+  postUrl,
+  payload as unknown as Record<string, unknown>,
+);
+
+log(
+  "info",
+  `[LOGIN DEBUG] HTTP status: ${res.status}`,
+);
+
+this.http.captureAuthHeaders(res);
+
+const body =
+  (await res.json()) as RawApiResponse;
+
+log(
+  "info",
+  `[LOGIN DEBUG] API code: ${String(body.code)}`,
+);
+
+log(
+  "info",
+  `[LOGIN DEBUG] API message: ${body.message ?? "(none)"}`,
+);
+
+const result =
+  normalizeLoginResponse(body);
 
       switch (result.nextState) {
         case "authenticated": {
